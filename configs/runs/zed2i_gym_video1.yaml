@@ -1,0 +1,33 @@
+# MAC-VO sequence config — gym video_1 (gimnasio de escalada, aire, ZED 2i)
+#
+# Generado 2026-06-10 desde la calibración de fábrica del SVO
+# (S/N 34111953 — cámara del GYM, distinta de la salmonera 36802538)
+# mediante `scripts/svo_to_stereo_pngs.py --scale 0.75`. HD720 1280×720
+# @30 fps → 960×540. LEFT y RIGHT comparten matriz K (rectificadas).
+# Baseline de `calibration_parameters.get_camera_baseline()`.
+#
+# GT del recorrido: ida recta sin loop, ≈10 m (cintas naranjas cada 1 m).
+#
+# Restricción CLAUDE.md §8: sólo LEEMOS calibración óptica de fábrica, no
+# la modificamos.
+
+type: GeneralStereo
+name: zed2i_gym_video1
+args:
+  # Ruta absoluta a la carpeta con subdirs left/ y right/
+  root: /home/wildsense/Documents/development/s_dpvio/data/recordings/gym_air/video_1_stereo
+
+  # Intrínsecos rectificados (LEFT == RIGHT por SDK)
+  # Sensor HD720 1280×720 → scale 0.75 → 960×540
+  # fx_full = 524.77777  cx_full = 670.87878
+  # fy_full = 524.77777  cy_full = 377.83502
+  camera:
+    fx: 393.583328
+    fy: 393.583328
+    cx: 503.159088
+    cy: 283.376266
+
+  # Baseline física ZED 2i SN 34111953 (de fábrica): 119.954 mm
+  bl: 0.11995411
+
+  format: png

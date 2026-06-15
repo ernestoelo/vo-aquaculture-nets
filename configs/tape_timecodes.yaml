@@ -1,0 +1,108 @@
+# tape_timecodes.yaml — Ground truth de cintas naranjas (usuario, 2026-06-10).
+#
+# El usuario reportó el INSTANTE (segundos de video, aproximado) en que la
+# cámara pasa por el MEDIO de cada cinta naranja. Las cintas están instaladas
+# cada 1 m sobre la malla → posición de la cinta N = (N-1) metros desde la
+# cinta 1. Todos los videos parten desde la cinta 1 (video_3 parte un poco
+# antes: cruza la cinta 1 en t=2 s).
+#
+# Precisión: timecodes "aproximados" (±0.5 s estimado, lectura visual del
+# usuario). La posición es 1-D a lo largo de la malla (recorrido recto);
+# para GT TUM se interpola linealmente entre cruces consecutivos.
+#
+# Conversión a frame-index (timestamps de trajectory.txt): frame = t_s × fps.
+# OJO con el skip de cada run (frame absoluto del SVO = el que se reporta acá).
+#
+# Finding: docs/findings/2026-06-10-gt-tape-timecodes-user.md
+
+gym_video_1:
+  file: data/recordings/gym_air/video_1.svo2
+  fps: 30
+  frames_total: 818
+  direction: lateral left, one-way (no loop)
+  camera_to_mesh_m: 2.0          # distancia aproximada cámara-malla
+  gt_total_m: [10.0, 11.0]       # camina "un poco más" tras la cinta 10
+  run_skip_frames: 15            # runs DPVO 2026-06-09 (0.5 s)
+  tapes:                          # {cinta: t_segundos} · pos_m = cinta - 1
+    1: 0
+    2: 4
+    3: 7
+    4: 10
+    5: 12
+    6: 15
+    7: 18
+    8: 21
+    9: 23
+    10: 25
+
+gym_video_2:
+  file: data/recordings/gym_air/video_2.svo2
+  fps: 30
+  frames_total: 1629
+  direction: lateral left, one-way (no loop)
+  camera_to_mesh_m: 1.0          # más cerca que video_1
+  gt_total_m: [10.0, 11.0]
+  run_skip_frames: 15
+  tapes:
+    1: 0
+    2: 10
+    3: 17
+    4: 24
+    5: 29
+    6: 34
+    7: 39
+    8: 44
+    9: 47
+    10: 51
+
+gym_video_3:
+  file: data/recordings/gym_air/video_3.svo2
+  fps: 30
+  frames_total: 1237
+  direction: lateral right, one-way (no loop)  # parte ANTES de la cinta 1
+  camera_to_mesh_m: 0.5          # corregido por el usuario 2026-06-12 (antes ~1.0)
+  gt_total_m: [9.0, 10.0]        # no alcanza la cinta 10
+  run_skip_frames: 15
+  tapes:
+    1: 2
+    2: 5
+    3: 11
+    4: 15
+    5: 20
+    6: 25
+    7: 29
+    8: 35
+    9: 40
+
+underwater_video_4:
+  file: data/recordings/_legacy_36802538/video_4.svo
+  fps: 25
+  frames_total: 2686
+  direction: left-to-right out, then return (loop)   # 10 m ida + 10 m vuelta
+  camera_to_mesh_m: null         # no reportado
+  gt_total_m: [18.0, 20.0]       # ida ~9-10 m + vuelta ~9-10 m (ver nota)
+  burned_first_s: 4              # primeros 4 s quemados (autoexposure)
+  run_skip_frames: 200           # = 8.0 s = cruce de cinta 2 (ida) — post-quemados
+  # NO HAY CINTA 10: tras la cinta 9 avanza ~1 m más y se devuelve.
+  # Cruce de retorno: las mismas cintas en orden inverso (sufijo _return).
+  tapes_out:                      # ida (izquierda)
+    1: 4
+    2: 8
+    3: 11
+    4: 13
+    5: 16
+    6: 19
+    7: 21
+    8: 23
+    9: 25
+  turnaround_extra_m: 1.0        # ~1 m después de cinta 9 (~9 m del origen)
+  tapes_return:                   # vuelta (derecha)
+    9: 39
+    8: 44
+    7: 49
+    6: 55
+    5: 62
+    4: 70
+    3: 76
+    2: 83
+    1: 88

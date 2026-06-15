@@ -1,0 +1,7 @@
+# Marco de evaluación (along-track + cierre de lazo). El pipeline completo
+# (DPVO/MAC-VO) requiere además torch+CUDA y los submódulos upstream — ver
+# MANIFEST.md y los instaladores del repo de trabajo.
+numpy>=1.24,<2.0
+pyyaml>=6.0
+matplotlib>=3.7
+evo>=1.28          # evaluación de trayectorias (referencia; el GT colineal usa el método along-track propio)

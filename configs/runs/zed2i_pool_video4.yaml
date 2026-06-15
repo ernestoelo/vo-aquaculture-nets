@@ -1,0 +1,32 @@
+# MAC-VO sequence config — video_4 (piscina universitaria, ZED 2i underwater)
+#
+# Generado 2026-05-18 desde la calibración de fábrica del SVO (S/N 36802538)
+# mediante `scripts/svo_to_stereo_pngs.py --scale 0.5`. La cámara LEFT viene
+# rectificada por el SDK; LEFT y RIGHT comparten matriz K (intrínsecos
+# rectificados idénticos). Baseline obtenida de
+# `calibration_parameters.stereo_transform.get_translation()[0]`.
+#
+# Restricción CLAUDE.md §8: sólo LEEMOS calibración óptica de fábrica, no
+# la modificamos. La refracción aire-agua no se compensa acá.
+
+type: GeneralStereo
+name: zed2i_pool_video4
+args:
+  # Ruta absoluta a la carpeta con subdirs left/ y right/
+  root: /home/wildsense/Documents/development/s_dpvio/data/recordings/video_4_stereo
+
+  # Intrínsecos rectificados (LEFT == RIGHT por SDK)
+  # Sensor full res 1920×1080 → scale 0.5 → 960×540
+  # fx_full = 1055.0945  cx_full = 967.6823
+  # fy_full = 1055.0945  cy_full = 528.6533
+  camera:
+    fx: 527.547224
+    fy: 527.547224
+    cx: 483.841125
+    cy: 264.326660
+
+  # Baseline física ZED 2i (de fábrica): 119.78 mm = 0.119776 m
+  # Config del paper ICRA25_Zed_0250 usa 0.119981 (otra unidad ZED 2i).
+  bl: 0.119776
+
+  format: png
