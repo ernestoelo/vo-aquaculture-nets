@@ -1,0 +1,484 @@
+diff --git a/dpvo/ba.py b/dpvo/ba.py
+index ace7163..551d7a2 100644
+--- a/dpvo/ba.py
++++ b/dpvo/ba.py
+@@ -13,13 +13,27 @@ class CholeskySolver(torch.autograd.Function):
+     @staticmethod
+     def forward(ctx, H, b):
+         # don't crash training if cholesky decomp fails
+-        U, info = torch.linalg.cholesky_ex(H)
++        try:
++            U, info = torch.linalg.cholesky_ex(H)
++            on_cpu = False
++        except RuntimeError:
++            # JP6/Tegra: libtorch_cuda_linalg.so (torch 2.8) referencia
++            # cusolverDnXsyevBatched_* que el cusolver Tegra 11.6.4 NO exporta
++            # -> el dlopen lazy del primer linalg CUDA revienta. Mismo bug que
++            # fastba (workarounds §20, finding 2026-06-03-dpvo-embedded-
++            # cusolver-ba-broken). H es chica (~6*ventana <= 120 dims) ->
++            # resolver en CPU cuesta despreciable. En x86 el try no falla y la
++            # numerica queda bit-exacta.
++            U, info = torch.linalg.cholesky_ex(H.cpu())
++            on_cpu = True
+ 
+         if torch.any(info):
+             ctx.failed = True
+             return torch.zeros_like(b)
+ 
+-        xs = torch.cholesky_solve(b, U)
++        xs = torch.cholesky_solve(b.cpu() if on_cpu else b, U)
++        if on_cpu:
++            xs = xs.to(H.device)
+         ctx.save_for_backward(U, xs)
+         ctx.failed = False
+ 
+@@ -83,8 +97,19 @@ def block_show(A):
+     plt.imshow(A[0].detach().cpu().numpy())
+     plt.show()
+ 
+-def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False):
+-    """ bundle adjustment """
++def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False, prior_d=None, prior_w=None, prior_strength=0.0, quality_boost=1.0):
++    """ bundle adjustment
++
++    prior_d / prior_w / prior_strength (variante C in-solver): factor unario de
++    profundidad `d ~ N(1/Z_zed, 1/wp)` por parche. `prior_d`, `prior_w` son
++    tensores planos indexados por el indice GLOBAL de parche (mismo que `kk`);
++    `prior_w` es la validez (0/1) y `prior_strength` la fuerza relativa al
++    termino de datos (wp = strength * mediana(C_validos)). A diferencia del blend
++    post-BA, este termino agrega curvatura a la dimension de profundidad y, via
++    el complemento de Schur, fuerza poses metricas (rompe el modo plano del gauge
++    mono). Backward-compatible: prior_w=None => BA original.
++    Ver finding 2026-06-05-dpvo-variant-c-scale-nondeterministic.
++    """
+ 
+     b = 1
+     n = max(ii.max().item(), jj.max().item()) + 1
+@@ -108,9 +133,20 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
+     if PRINT:
+         print((r * v[...,None]).norm(dim=-1).mean().item())
+ 
+-    r = (v[...,None] * r).unsqueeze(dim=-1)    
++    r = (v[...,None] * r).unsqueeze(dim=-1)
+     weights = (v[...,None] * weights).unsqueeze(dim=-1)
+ 
++    # --- peso 2D informado (campaña Hito 3, reducción de jitter) ---
++    # Aumenta la confianza del residual de reproyección de las observaciones cuyo
++    # parche tiene depth métrica ZED válida (anclaje fiable) y deja igual al resto.
++    # Los parches sin anclaje (zonas homogéneas/lejanas) suelen dar flujo ruidoso
++    # que mete jitter en las poses. `kk` aquí es aún el índice GLOBAL de parche
++    # (el remap a único es más abajo), así que prior_w[kk] da la validez por
++    # observación. quality_boost=1.0 ⇒ comportamiento original.
++    if (prior_w is not None) and (quality_boost != 1.0):
++        qf = (1.0 + (quality_boost - 1.0) * prior_w[kk]).view(1, -1, 1, 1)
++        weights = weights * qf
++
+     wJiT = (weights * Ji).transpose(2,3)
+     wJjT = (weights * Jj).transpose(2,3)
+     wJzT = (weights * Jz).transpose(2,3)
+@@ -152,6 +188,18 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
+ 
+     w = safe_scatter_add_vec(torch.matmul(wJzT,  r), kk, m)
+ 
++    # --- variante C in-solver: prior unario de profundidad (curvatura -> Schur) ---
++    if (prior_w is not None) and (prior_d is not None) and (prior_strength > 0):
++        pw = prior_w[kx]                                   # (m,) validez 0/1
++        if torch.any(pw > 0):
++            Cdiag = C.view(b, m)[0]                        # (m,) Hessian de datos
++            cref = Cdiag[pw > 0].median() if (pw > 0).any() else C.new_tensor(1.0)
++            wp = (prior_strength * cref * pw).view(b, m, 1, 1)
++            d_cur = patches[:, kx, 2, p // 2, p // 2].view(b, m, 1, 1)
++            d_zed = prior_d[kx].view(b, m, 1, 1)
++            C = C + wp                                     # +curvatura en profundidad
++            w = w + wp * (d_zed - d_cur)                   # +gradiente del prior
++
+     if isinstance(lmbda, torch.Tensor):
+         lmbda = lmbda.reshape(*C.shape)
+         
+diff --git a/dpvo/config.py b/dpvo/config.py
+index be1c500..a0f8e2b 100644
+--- a/dpvo/config.py
++++ b/dpvo/config.py
+@@ -8,6 +8,23 @@ _C.BUFFER_SIZE = 2048
+ # bias patch selection towards high gradient regions?
+ _C.GRADIENT_BIAS = True
+ 
++# patch selection strategy (campaña Hito 3, reducción de jitter):
++#   'random'      -> muestreo uniforme (DPVO original; GRADIENT_BIAS lo overridea)
++#   'gradient'    -> top-gradiente GLOBAL (equiv. a GRADIENT_BIAS=True)
++#   'bucket'      -> grilla espacial + mejor parche por celda: cobertura uniforme
++#                    Y alto gradiente -> mejor condicionamiento geométrico del BA.
++#   'depth_valid' -> validez de depth ZED como FILTRO de candidatos + ranking
++#                    por gradiente entre los válidos (mejora #2 Hito 3; requiere
++#                    pasar depth= al patchify — handoff 2026-06-12). Sin depth
++#                    cae a 'random'.
++#   'depth_valid_random' -> filtro de validez puro: aleatorio ENTRE los
++#                    válidos (sin ranking por gradiente — aísla el filtro del
++#                    clustering del híbrido). Sin depth cae a 'random'.
++#   'auto'        -> deriva de GRADIENT_BIAS (compat: True->'gradient', False->'random').
++_C.PATCH_SELECTION = 'auto'
++# oversample por celda (modo bucket) / global (modo gradient): candidatos = K * P.
++_C.PATCH_OVERSAMPLE = 8
++
+ # VO config (increase for better accuracy)
+ _C.PATCHES_PER_FRAME = 80
+ _C.REMOVAL_WINDOW = 20
+diff --git a/dpvo/dpvo.py b/dpvo/dpvo.py
+index 65646a3..8cd6254 100644
+--- a/dpvo/dpvo.py
++++ b/dpvo/dpvo.py
+@@ -48,6 +48,16 @@ class DPVO:
+         self.index_ = torch.zeros(self.N, self.M, dtype=torch.long, device="cuda")
+         self.index_map_ = torch.zeros(self.N, dtype=torch.long, device="cuda")
+ 
++        # variante C (prior blando de profundidad): profundidad inversa medida
++        # del ZED (1/Z) por parche + peso de validez, alineados por slot de
++        # frame con patches_ (se desplazan junto a el en keyframe()). Solo se
++        # llenan/usan en depth_inject_mode == "prior". Ver finding
++        # 2026-06-05-dpvo-metric-depth-injection-prototype (variante C).
++        self.disps_prior_ = torch.zeros(self.N, self.M, device="cuda")
++        self.disps_prior_w_ = torch.zeros(self.N, self.M, device="cuda")
++        self.depth_prior_alpha = 0.0      # blend post-BA (modo "prior", gauge-libre)
++        self.depth_prior_strength = 0.0   # factor unario in-solver (modo "prior_insolver")
++
+         ### network attributes ###
+         self.mem = 32
+ 
+@@ -232,6 +242,8 @@ class DPVO:
+                 self.colors_[i] = self.colors_[i+1]
+                 self.poses_[i] = self.poses_[i+1]
+                 self.patches_[i] = self.patches_[i+1]
++                self.disps_prior_[i] = self.disps_prior_[i+1]
++                self.disps_prior_w_[i] = self.disps_prior_w_[i+1]
+                 self.intrinsics_[i] = self.intrinsics_[i+1]
+ 
+                 self.imap_[i%self.mem] = self.imap_[(i+1) % self.mem]
+@@ -263,12 +275,21 @@ class DPVO:
+             t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
+             t0 = max(t0, 1)
+ 
+-            try:
+-                fastba.BA(self.poses, self.patches, self.intrinsics, 
+-                    target, weight, lmbda, self.ii, self.jj, self.kk, t0, self.n, 2)
+-            except:
+-                print("Warning BA failed...")
+-            
++            mode = getattr(self, "depth_inject_mode", "off")
++            if mode == "prior_insolver":
++                # variante C in-solver: BA de Python con factor unario de depth
++                self._ba_python_prior(target, weight, t0)
++            else:
++                try:
++                    fastba.BA(self.poses, self.patches, self.intrinsics,
++                        target, weight, lmbda, self.ii, self.jj, self.kk, t0, self.n, 2)
++                except:
++                    print("Warning BA failed...")
++
++                # variante C (post-paso): ancla blanda de la profundidad (gauge-libre)
++                if mode == "prior":
++                    self._apply_depth_prior(t0)
++
+             points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+             self.points_[:len(points)] = points[:]
+@@ -293,7 +314,88 @@ class DPVO:
+         return flatmeshgrid(torch.arange(t0, t1, device="cuda"),
+             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
+ 
+-    def __call__(self, tstamp, image, intrinsics):
++    def _seed_inverse_depth(self, patches, depth):
++        """Siembra la profundidad inversa de los parches desde un mapa de
++        profundidad métrica (metros).
++
++        `patches`: (1, M, 3, P, P) con coords de imagen (x, y) a resolución de
++        feature en los canales 0,1. `depth`: (H, W) float en metros a la
++        resolución de la imagen de entrada (pre-RES). La profundidad inválida
++        (<=0, nan, inf) se rellena con la mediana de los parches válidos.
++        Retorna (1, M, 1, 1) profundidad inversa clampeada al rango del BA
++        [1e-3, 10]. Punto de inyección: ver finding
++        2026-06-05-dpvo-sigma-vs-macvo-covariance-audit.
++        """
++        P = patches.shape[-1]
++        cx = patches[0, :, 0, P // 2, P // 2]   # x a feature-res
++        cy = patches[0, :, 1, P // 2, P // 2]   # y a feature-res
++        H, W = depth.shape[-2], depth.shape[-1]
++        u = (self.RES * cx).round().long().clamp(0, W - 1)
++        v = (self.RES * cy).round().long().clamp(0, H - 1)
++        Z = depth[v, u].float()
++        valid = torch.isfinite(Z) & (Z > 1e-3)
++        d = torch.zeros_like(Z)
++        d[valid] = 1.0 / Z[valid]
++        if valid.any():
++            d[~valid] = d[valid].median()
++        else:
++            d[:] = 1.0
++        d = d.clamp(min=1e-3, max=10.0)
++        return d[None, :, None, None], valid
++
++    def _apply_depth_prior(self, t0):
++        """Variante C — prior blando de profundidad (post-paso BA).
++
++        Tras un paso de `fastba.BA`, empuja la profundidad inversa de los
++        parches con prior valido hacia `1/Z_zed` con peso `alpha`:
++            disps <- (1 - alpha*w) * disps_BA + (alpha*w) * d_zed
++        `alpha=1` fija (hard) la depth sembrada -> rompe la libertad de gauge
++        que deja la siembra-como-init (fase 2: el BA respeta el seed pero el
++        neto sigue gauge-libre); `alpha<1` la ancla de forma blanda. Opera solo
++        sobre la ventana de optimizacion [t0, n). Python puro (sin tocar CUDA).
++        Ver finding 2026-06-05-dpvo-metric-depth-injection-prototype (variante C).
++        """
++        a = float(getattr(self, "depth_prior_alpha", 0.0))
++        if a <= 0.0:
++            return
++        lo, hi = max(int(t0), 0), self.n
++        if hi <= lo:
++            return
++        w = self.disps_prior_w_[lo:hi]                 # (F, M)
++        if not bool(torch.any(w > 0)):
++            return
++        aw = (a * w)[..., None, None]                  # (F, M, 1, 1)
++        cur = self.patches_[lo:hi, :, 2]               # (F, M, P, P)
++        d_prior = self.disps_prior_[lo:hi][..., None, None]
++        blended = (1.0 - aw) * cur + aw * d_prior
++        self.patches_[lo:hi, :, 2] = blended.clamp(min=1e-3, max=10.0)
++
++    def _ba_python_prior(self, target, weight, t0):
++        """Variante C in-solver: corre la BA de Python (`ba.py`) con un factor
++        unario de profundidad DENTRO del solver (en vez de `fastba` + blend
++        post-paso). El prior agrega curvatura a la dimension de profundidad y, via
++        Schur, fuerza poses metricas -> rompe el modo plano del gauge mono que el
++        blend post-BA no podia tocar. Mas lento que `fastba` (x86 research). Ver
++        finding 2026-06-05-dpvo-variant-c-scale-nondeterministic.
++        """
++        from .ba import BA as _pyBA
++        bounds = [-64, -64, self.wd // self.RES + 64, self.ht // self.RES + 64]
++        Gs = SE3(self.poses)
++        patches = self.patches
++        prior_d = self.disps_prior_.view(-1)
++        prior_w = self.disps_prior_w_.view(-1)
++        strength = float(getattr(self, "depth_prior_strength", 0.0))
++        qboost = float(getattr(self, "depth_quality_boost", 1.0))
++        for _ in range(2):
++            Gs, patches = _pyBA(
++                Gs, patches, self.intrinsics, target, weight, 1e-4,
++                self.ii, self.jj, self.kk, bounds, ep=10.0, fixedp=t0,
++                structure_only=False, prior_d=prior_d, prior_w=prior_w,
++                prior_strength=strength, quality_boost=qboost)
++        self.poses_[:] = Gs.data[0]
++        self.patches_[:] = patches.view(self.N, self.M, 3, self.P, self.P)
++
++    def __call__(self, tstamp, image, intrinsics, depth=None):
+         """ track new frame """
+ 
+         if (self.n+1) >= self.N:
+@@ -304,8 +406,11 @@ class DPVO:
+         with autocast(enabled=self.cfg.MIXED_PRECISION, device_type="cuda"):
+             fmap, gmap, imap, patches, _, clr = \
+                 self.network.patchify(image,
+-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
+-                    gradient_bias=self.cfg.GRADIENT_BIAS, 
++                    patches_per_image=self.cfg.PATCHES_PER_FRAME,
++                    gradient_bias=self.cfg.GRADIENT_BIAS,
++                    selection=getattr(self.cfg, "PATCH_SELECTION", None),
++                    oversample=getattr(self.cfg, "PATCH_OVERSAMPLE", 8),
++                    depth=depth,
+                     return_color=True)
+ 
+         ### update state attributes ###
+@@ -332,11 +437,30 @@ class DPVO:
+                 tvec_qvec = self.poses[self.n-1]
+                 self.poses_[self.n] = tvec_qvec
+ 
+-        # TODO better depth initialization
+-        patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
+-        if self.is_initialized:
+-            s = torch.median(self.patches_[self.n-3:self.n,:,2])
+-            patches[:,:,2] = s
++        # --- siembra de profundidad inversa de los parches (init de escala) ---
++        # Default DPVO: profundidad inversa aleatoria -> escala-ambiguo (mono).
++        # Inyección métrica opcional: si se entrega `depth` (metros, misma
++        # resolución que `image`) y `depth_inject_mode` está activo, sembrar
++        # d = 1/Z -> recupera escala métrica. Modos: off | init | always.
++        inject_mode = getattr(self, "depth_inject_mode", "off")
++        do_inject = (depth is not None) and (
++            inject_mode in ("always", "prior", "prior_insolver")
++            or (inject_mode == "init" and not self.is_initialized)
++        )
++        if do_inject:
++            d_seed, valid_seed = self._seed_inverse_depth(patches, depth)
++            patches[:,:,2] = d_seed
++            if inject_mode in ("prior", "prior_insolver"):
++                # guardar el prior por parche (variante C). "prior": se mezcla
++                # post-paso (gauge-libre). "prior_insolver": entra como factor
++                # unario DENTRO de la BA de Python (rompe el gauge).
++                self.disps_prior_[self.n] = d_seed.view(self.M)
++                self.disps_prior_w_[self.n] = valid_seed.float()
++        else:
++            patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
++            if self.is_initialized:
++                s = torch.median(self.patches_[self.n-3:self.n,:,2])
++                patches[:,:,2] = s
+ 
+         self.patches_[self.n] = patches
+ 
+diff --git a/dpvo/fastba/ba_cuda.cu b/dpvo/fastba/ba_cuda.cu
+index 134d3ff..d362ee8 100644
+--- a/dpvo/fastba/ba_cuda.cu
++++ b/dpvo/fastba/ba_cuda.cu
+@@ -518,8 +518,10 @@ std::vector<torch::Tensor> cuda_ba(
+       S += I * (1e-4 * S + 1.0);
+ 
+ 
+-      torch::Tensor U = torch::linalg_cholesky(S);
+-      torch::Tensor dX = torch::cholesky_solve(y, U);
++      // JP6 cuSOLVER mismatch: Cholesky del BA en CPU (S es 6*N, pequeno).
++      // Ver docs/findings/2026-06-03-dpvo-embedded-cusolver-ba-broken.md
++      torch::Tensor U = torch::linalg_cholesky(S.cpu());
++      torch::Tensor dX = torch::cholesky_solve(y.cpu(), U).to(S.device());
+       torch::Tensor dZ = Qt * (u - torch::matmul(Et, dX));
+ 
+       dX = dX.view({N, 6});
+diff --git a/dpvo/net.py b/dpvo/net.py
+index 2e74df7..126b77d 100644
+--- a/dpvo/net.py
++++ b/dpvo/net.py
+@@ -104,7 +104,44 @@ class Patchifier(nn.Module):
+         g = F.avg_pool2d(g, 4, 4)
+         return g
+ 
+-    def forward(self, images, patches_per_image=80, disps=None, gradient_bias=False, return_color=False):
++    def __bucket_select(self, images, n, h, w, P, oversample):
++        """Selección guiada con bucketing espacial (campaña Hito 3).
++
++        Divide el plano de feature (h×w) en una grilla de ~P celdas con aspect
++        ≈ w/h; en cada celda muestrea `oversample` candidatos al azar y se queda
++        con el de mayor gradiente. Garantiza COBERTURA uniforme (vs el top-K
++        global de `gradient`, que clusteriza en una región muy texturada y deja
++        zonas sin parches → BA mal condicionado → jitter). Devuelve x, y long
++        (n, P). Idea validada por MAC-VO §III-B (muestreo estructurado).
++        """
++        gx = max(1, int(round((P * w / max(h, 1)) ** 0.5)))
++        gy = max(1, int(np.ceil(P / gx)))
++        ncell = gx * gy
++        K = max(1, int(oversample))
++        cw = (w - 2.0) / gx
++        ch = (h - 2.0) / gy
++        cidx = torch.arange(ncell, device="cuda")
++        x0 = 1.0 + (cidx % gx).float() * cw          # (ncell,) esquina de celda
++        y0 = 1.0 + (cidx // gx).float() * ch
++        rx = torch.rand(n, ncell, K, device="cuda")
++        ry = torch.rand(n, ncell, K, device="cuda")
++        xc = (x0.view(1, ncell, 1) + rx * cw).clamp(1, w - 2)   # (n, ncell, K)
++        yc = (y0.view(1, ncell, 1) + ry * ch).clamp(1, h - 2)
++        coords = torch.stack([xc.reshape(n, -1), yc.reshape(n, -1)], dim=-1)
++        g = self.__image_gradient(images)
++        gv = altcorr.patchify(g[0, :, None], coords, 0).view(n, ncell, K)
++        best = gv.argmax(dim=2, keepdim=True)         # mejor candidato por celda
++        xw = torch.gather(xc, 2, best).squeeze(-1)    # (n, ncell)
++        yw = torch.gather(yc, 2, best).squeeze(-1)
++        gw = torch.gather(gv, 2, best).squeeze(-1)
++        if ncell > P:                                  # grilla excede P -> top-P por gradiente
++            keep = torch.argsort(gw, dim=1)[:, -P:]
++            xw = torch.gather(xw, 1, keep)
++            yw = torch.gather(yw, 1, keep)
++        return xw.round().long(), yw.round().long()
++
++    def forward(self, images, patches_per_image=80, disps=None, gradient_bias=False,
++                selection=None, oversample=8, depth=None, return_color=False):
+         """ extract patches from input images """
+         fmap = self.fnet(images) / 4.0
+         imap = self.inet(images) / 4.0
+@@ -112,15 +149,69 @@ class Patchifier(nn.Module):
+         b, n, c, h, w = fmap.shape
+         P = self.patch_size
+ 
+-        # bias patch selection towards regions with high gradient
+-        if gradient_bias:
++        # estrategia de selección de parches (Hito 3). 'auto'/None deriva de
++        # gradient_bias (compat): True ⇒ 'gradient', False ⇒ 'random'. Un valor
++        # explícito ('random'|'gradient'|'bucket'|'depth_valid') tiene precedencia.
++        if selection in (None, 'auto'):
++            selection = 'gradient' if gradient_bias else 'random'
++        if selection in ('depth_valid', 'depth_valid_random') and depth is None:
++            # sin mapa de depth la validez es indecidible; caer a 'random'
++            # (el control del benchmark), NO a 'gradient' (top-grad global
++            # empeora el jitter — finding 2026-06-07).
++            selection = 'random'
++
++        if selection == 'bucket':
++            x, y = self.__bucket_select(images, n, h, w, patches_per_image, oversample)
++
++        elif selection in ('depth_valid', 'depth_valid_random'):
++            # Mejora #2 Hito 3: validez de depth como FILTRO de candidatos +
++            # ranking por gradiente ENTRE los válidos (híbrido). Mantiene el
++            # mapa de depth completo (filtrar el mapa colapsa la escala uw:
++            # finding 2026-06-12-depth-confidence-sweep-5m-cap) y NO impone
++            # cobertura espacial (el bucket ciego dispersó parches a zonas
++            # sin depth y rompió la escala — finding 2026-06-07). Fallback
++            # obligatorio: si hay <P candidatos válidos (uw: frames con
++            # 7-11% de depth válida) rellenan los inválidos, también
++            # rankeados por gradiente.
++            x = torch.randint(1, w-1, size=[n, oversample*patches_per_image], device="cuda")
++            y = torch.randint(1, h-1, size=[n, oversample*patches_per_image], device="cuda")
++
++            # los parches viven a res/4: mismo mapeo feature→imagen que
++            # DPVO._seed_inverse_depth (u = RES·x), para que "candidato
++            # válido" coincida 1:1 con "parche con ancla" en la siembra.
++            H, W = depth.shape[-2], depth.shape[-1]
++            u = (4 * x).clamp(0, W - 1)
++            v = (4 * y).clamp(0, H - 1)
++            Z = depth.view(H, W)[v, u]
++            valid = torch.isfinite(Z) & (Z > 1e-3)
++            self.last_valid_candidate_frac = float(valid.float().mean())
++
++            if selection == 'depth_valid':
++                # híbrido: válidos SIEMPRE por sobre inválidos; el gradiente
++                # desempata dentro de cada grupo (offset > rango del frame).
++                coords = torch.stack([x, y], dim=-1).float()
++                g = self.__image_gradient(images)
++                gv = altcorr.patchify(g[0,:,None], coords, 0).view(n, oversample*patches_per_image)
++                span = (gv.max() - gv.min()).clamp(min=1.0)
++                score = gv + valid.float() * 2.0 * span
++            else:
++                # filtro puro ('depth_valid_random'): aleatorio ENTRE los
++                # válidos — aísla el filtro del ranking por gradiente, que
++                # clusteriza y sesga (resultado sweep 2026-06-12: el híbrido
++                # colapsa la escala aire a ~0.65-0.70 con ATE 10×).
++                score = torch.rand(x.shape, device="cuda") + valid.float() * 2.0
++            ix = torch.argsort(score, dim=1)
++            x = torch.gather(x, 1, ix[:, -patches_per_image:])
++            y = torch.gather(y, 1, ix[:, -patches_per_image:])
++
++        elif selection == 'gradient':
+             g = self.__image_gradient(images)
+-            x = torch.randint(1, w-1, size=[n, 3*patches_per_image], device="cuda")
+-            y = torch.randint(1, h-1, size=[n, 3*patches_per_image], device="cuda")
++            x = torch.randint(1, w-1, size=[n, oversample*patches_per_image], device="cuda")
++            y = torch.randint(1, h-1, size=[n, oversample*patches_per_image], device="cuda")
+ 
+             coords = torch.stack([x, y], dim=-1).float()
+-            g = altcorr.patchify(g[0,:,None], coords, 0).view(n, 3 * patches_per_image)
+-            
++            g = altcorr.patchify(g[0,:,None], coords, 0).view(n, oversample * patches_per_image)
++
+             ix = torch.argsort(g, dim=1)
+             x = torch.gather(x, 1, ix[:, -patches_per_image:])
+             y = torch.gather(y, 1, ix[:, -patches_per_image:])
+@@ -128,7 +219,7 @@ class Patchifier(nn.Module):
+         else:
+             x = torch.randint(1, w-1, size=[n, patches_per_image], device="cuda")
+             y = torch.randint(1, h-1, size=[n, patches_per_image], device="cuda")
+-        
++
+         coords = torch.stack([x, y], dim=-1).float()
+         imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
+         gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, 128, P, P)
+diff --git a/dpvo/scatter_ops.py b/dpvo/scatter_ops.py
+index f8f91d0..9ac6c66 100644
+--- a/dpvo/scatter_ops.py
++++ b/dpvo/scatter_ops.py
+@@ -1,3 +1,4 @@
++from __future__ import annotations
+ """
+ Native PyTorch implementations of scatter operations.
+ 

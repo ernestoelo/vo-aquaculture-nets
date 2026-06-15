@@ -1,36 +1,48 @@
-# MANIFEST — archivos de la entrega y dónde vive cada pieza
+# MANIFEST — contenido de la entrega
 
-Este directorio es un **export curado** del repositorio de trabajo. Incluye
-el marco de evaluación y los configs (autocontenidos); los *scripts* del
-pipeline completo dependen de los submódulos upstream y se listan abajo con
-su ruta en el repo de trabajo para quien quiera reproducir end-to-end.
+Export curado del repositorio de trabajo. Incluye **el algoritmo y la
+implementación** (modificación DPVO métrico), los scripts de corrida, el
+marco de evaluación y los configs. Las dependencias upstream (DPVO base,
+MAC-VO, ZED SDK) no se redistribuyen; se obtienen como se indica abajo.
 
-## Incluido aquí (autocontenido)
+## La implementación — `dpvo_metric/`
 
 | Archivo | Rol |
 |---|---|
-| `eval/eval_ate_tape_gt.py` | Métricas along-track + cierre de lazo (ATE/RPE/deriva/escala/loop) |
-| `eval/build_gt_tum.py` | Construye el GT TUM desde los timecodes de cintas |
-| `eval/make_slide_resultados_benchmark.py` | Genera la tabla maestra del benchmark |
-| `configs/tape_timecodes.yaml` | Ground truth de cintas (los 4 videos) |
-| `configs/runs/*.yaml` | Configs de corrida por secuencia |
-| `README.md` | Portada: métodos, modificación, reproducción, resultados |
-| `requirements.txt` | Dependencias del marco de evaluación |
+| `dpvo_metric.patch` | **Nuestra contribución**: 484 líneas sobre `MAC-VO/S_DPVO@f7266f7` |
+| `src/ba.py` | factor unario de profundidad en el BA (`E_prior`) |
+| `src/dpvo.py` | ruteo del modo métrico, inyección del prior por-parche |
+| `src/net.py` | estrategias de selección de parches (`PATCH_SELECTION`) |
+| `src/config.py`, `src/scatter_ops.py`, `src/fastba/ba_cuda.cu` | claves de config, compat. Py3.8, firma BA CUDA |
+| `config/*.yaml` | configs canónicos (x86, embarcado, recomendado métrico) |
+| `LICENSE-DPVO` | MIT upstream (retenida) |
+| `README.md` | dónde está cada cambio + cómo reproducir |
 
-## Pipeline completo (en el repo de trabajo, depende de upstream)
+## Scripts de corrida — `scripts/`
 
 | Script | Rol |
 |---|---|
-| `run_sdpvo_metric.py` | Corre DPVO métrico (modificación: `--inject prior_insolver`) |
-| `run_sdpvo_offline.py` | Corre DPVO mono (baseline) |
-| `run_zed_pt.py` | Corre el *positional tracking* del SDK de ZED |
-| `svo_to_stereo_pngs.py` | Extrae pares estéreo left/right para MAC-VO |
-| `smooth_trajectory.py` | Filtro savgol post-proceso (longitud de arco) |
+| `run_sdpvo_metric.py` | DPVO métrico (`--inject prior_insolver`) |
+| `run_sdpvo_offline.py` | DPVO mono (baseline) |
+| `run_zed_pt.py` | *positional tracking* del SDK de ZED |
+| `svo_to_stereo_pngs.py` | extrae pares estéreo left/right para MAC-VO |
+| `smooth_trajectory.py` | filtro savgol post-proceso (longitud de arco) |
 
-## La modificación DPVO métrico
+## Evaluación — `eval/`
 
-El factor unario de profundidad (`E_prior`, ver README §2) se inyecta en el
-**bundle adjustment de Python** del fork DPVO (`dpvo/ba.py`, ruteado desde
-`dpvo/dpvo.py`). No recompila CUDA. Se activa con
-`--inject prior_insolver --prior-strength 1000`. El fork base es
-`princeton-vl/DPVO` adaptado a torch reciente.
+| Script | Rol |
+|---|---|
+| `eval_ate_tape_gt.py` | métricas along-track + cierre de lazo |
+| `build_gt_tum.py` | GT TUM desde los timecodes de cintas |
+| `make_slide_resultados_benchmark.py` | tabla maestra del benchmark |
+
+## Configs — `configs/`
+
+`tape_timecodes.yaml` (GT de cintas, 4 videos) + `runs/*.yaml`
+(config por secuencia).
+
+## Upstream (no redistribuido — ver `NOTICE.md`)
+
+- **DPVO base** — `MAC-VO/S_DPVO@f7266f7` (clonar + aplicar el patch).
+- **MAC-VO** — `MAC-VO/MAC-VO` (paper Qiu et al. 2025).
+- **ZED SDK** 5.x + `pyzed` (Stereolabs).

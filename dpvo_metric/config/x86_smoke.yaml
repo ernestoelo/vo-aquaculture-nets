@@ -1,0 +1,16 @@
+### DPVO Config — x86 smoke @ RTX 3060 12GB
+# Memoria reducida vs default.yaml para validar pipeline E2E en 12 GB.
+# Para runs reales subir PATCHES_PER_FRAME a 96 (default.yaml) o 48 (fast.yaml).
+
+PATCHES_PER_FRAME: 24
+REMOVAL_WINDOW: 10
+OPTIMIZATION_WINDOW: 5
+PATCH_LIFETIME: 8
+
+KEYFRAME_THRESH: 15.0
+
+MOTION_MODEL: 'DAMPED_LINEAR'
+MOTION_DAMPING: 0.5
+
+MIXED_PRECISION: True
+GRADIENT_BIAS: False

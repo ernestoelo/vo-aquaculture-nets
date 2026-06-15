@@ -7,6 +7,16 @@ cámara estéreo ZED 2i, en aire y bajo el agua.
 **Autores:** Ernesto Gamero, Fernanda Quintana — UTFSM.
 **Informe:** el PDF escrito (formato IEEE-conf) se entrega por separado; este repositorio contiene el código de reproducción y evaluación.
 
+## Estructura
+
+```
+dpvo_metric/   NUESTRA modificación de DPVO (escala métrica): patch + src/ + configs
+scripts/       scripts de corrida de los 4 modelos (DPVO mono/métrico, MAC-VO prep, ZED PT)
+eval/          marco de evaluación (ATE along-track + cierre de lazo)
+configs/       ground truth de cintas + configs de corrida por secuencia
+NOTICE.md      atribución de terceros (DPVO MIT, MAC-VO, ZED SDK)
+```
+
 ---
 
 ## 1. Qué se evalúa
@@ -32,9 +42,10 @@ E_prior = Σ_p  w_p · ( d_p − 1/Z_zed,p )²
 
 sumado al residuo de reproyección. Anclar la profundidad *dentro* de la
 optimización (no como reescalado posterior) recupera una escala estable.
-Implementación: factor unario en el BA de Python del fork DPVO, ruteado con
-`run_sdpvo_metric.py --inject prior_insolver --prior-strength 1000`
-(no recompila CUDA). Ver `MANIFEST.md` para los archivos exactos.
+**El código de la modificación está en [`dpvo_metric/`](dpvo_metric/)**:
+el patch (`dpvo_metric.patch`, 484 líneas sobre `MAC-VO/S_DPVO@f7266f7`),
+los archivos modificados completos (`src/`) y los configs. Ver
+[`dpvo_metric/README.md`](dpvo_metric/README.md) para dónde está cada cambio.
 
 ## 3. Métricas
 
@@ -52,8 +63,9 @@ sobre el eje principal). Métricas: **ATE**, **RPE traslacional (1 m)**,
 # 1. Construir el GT TUM desde los timecodes de cintas
 python eval/build_gt_tum.py --config configs/tape_timecodes.yaml --out results/gt/
 
-# 2. Correr un modelo (requiere el pipeline completo — ver MANIFEST.md)
-python run_sdpvo_metric.py --config configs/runs/zed2i_gym_video1.yaml \
+# 2. Correr DPVO métrico (tras aplicar dpvo_metric/dpvo_metric.patch sobre
+#    el fork base — ver dpvo_metric/README.md; requiere torch+CUDA y pyzed)
+python scripts/run_sdpvo_metric.py --config configs/runs/zed2i_gym_video1.yaml \
     --inject prior_insolver --prior-strength 1000
 
 # 3. Evaluar contra el GT

@@ -1,0 +1,16 @@
+### DPVO config — ZedBox JP6 low-memory (memoria unificada 16GB) ###
+# Reduce la huella de memoria para que DPVO con BA funcional quepa en la
+# memoria unificada del Orin NX (16GB CPU+GPU compartida) en videos de
+# movimiento continuo donde el keyframe-removal no acota el working-set.
+# Ver docs/findings/2026-06-03-dpvo-embedded-cusolver-ba-broken.md
+
+PATCHES_PER_FRAME: 48      # default 96 -> mitad de aristas/correlacion
+REMOVAL_WINDOW: 14         # default 22 -> ventana activa mas corta
+OPTIMIZATION_WINDOW: 8     # default 10
+PATCH_LIFETIME: 10         # default 13
+
+KEYFRAME_THRESH: 15.0
+MOTION_MODEL: 'DAMPED_LINEAR'
+MOTION_DAMPING: 0.5
+MIXED_PRECISION: True
+GRADIENT_BIAS: False
