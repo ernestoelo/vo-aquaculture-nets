@@ -139,6 +139,20 @@ pierde por completo. Expresado como deriva honesta (cierre / recorrido de
 18 m) es **27 %** (DPVO métrico) y **21 %** (MAC-VO), no el engañoso
 16.9 / 15.2 % que daría la fórmula estándar sobre un loop.
 
+### Recorrido (path length) por video — DPVO métrico crudo
+
+| Secuencia | Path estimado | GT | Path / GT |
+|---|---|---|---|
+| gym_v1 (aire) | ~12 m | ~10 m | 1.2× |
+| gym_v2 (aire) | ~17 m | ~10 m | 1.7× |
+| gym_v3 (aire) | ~17 m | ~10 m | 2.5× |
+| **video_4 (agua, loop)** | **~50 m** | 18 m | **~10×** |
+
+El exceso sobre el GT es **temblor de alta frecuencia** (un filtro Savitzky–Golay
+lo reduce sin cambiar el ATE). En aire es modesto (1.2–2.5×); en `video_4` el
+recorrido se dispara a **~50 m sobre un loop de 18 m** (~10× el neto): es el
+**peor caso del benchmark** y la firma del colapso subacuático.
+
 **En aire** nuestra modificación supera a los métodos del estado del arte
 evaluados; la ventaja crece a corta distancia de la malla (aliasing del
 patrón repetitivo). **Bajo el agua**, en el loop, los tres colapsan.
