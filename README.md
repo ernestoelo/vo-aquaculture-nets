@@ -109,17 +109,39 @@ python eval/eval_ate_tape_gt.py \
 
 ## 6. Resultados (resumen)
 
+### ATE — error de posición (alineamiento rígido, sin escala)
+
 | Secuencia | DPVO métrico (ATE) | MAC-VO | ZED PT |
 |---|---|---|---|
 | gym_v1 (aire, ~2 m malla) | **0.114 m** | 0.258 | 1.161 |
 | gym_v2 (aire, ~1 m malla) | **0.257 m** | 1.771 | 2.664 |
 | gym_v3 (aire, ~0.5 m malla) | **0.274 m** | 1.449 | 1.991 |
-| video_4 (agua, loop) | 2.382 m | 3.007 | 2.660 |
+| video_4 (agua, loop) | 2.382 m\* | 3.007\* | 2.660\* |
+
+\* **En un *loop* (ida y vuelta) el ATE along-track es ciego al colapso**:
+centra y proyecta a 1-D, y la deriva se diluye porque el desplazamiento
+neto debería ser ≈0. La cifra de aspecto moderado (2.382 m) **no comunica**
+que la trayectoria no regresa. La métrica honesta es el **error de cierre
+de lazo**:
+
+### Cierre de lazo — video_4 (la métrica honesta del loop)
+
+| Modelo | Cierre ‖fin−inicio‖ | Excursión máx / GT | Path recorrido | Escala GT/est |
+|---|---|---|---|---|
+| Referencia (GT) | 0.0 m | 9.0 / 9.0 m | 18.0 m | 1.000 |
+| **DPVO métrico** | **4.9 m** | 4.9 / 9.0 m | 50.2 m | 0.783 |
+| MAC-VO | **3.8 m** | 3.8 / 9.0 m | 22.7 m | 0.281 |
+| DPVO mono | 54.5 m | 55.8 / 9.0 m | 280.6 m | 0.092 |
+
+El GT cierra el lazo (vuelve a la cinta 1, cierre ≈ 0), pero ambos métodos
+**avanzan ~la mitad del recorrido y no regresan**: el "ida y vuelta" se
+pierde por completo. Expresado como deriva honesta (cierre / recorrido de
+18 m) es **27 %** (DPVO métrico) y **21 %** (MAC-VO), no el engañoso
+16.9 / 15.2 % que daría la fórmula estándar sobre un loop.
 
 **En aire** nuestra modificación supera a los métodos del estado del arte
 evaluados; la ventaja crece a corta distancia de la malla (aliasing del
-patrón repetitivo). **Bajo el agua**, en el loop, los tres colapsan
-(cierre de lazo 3.8–4.9 m sobre un recorrido que debía cerrar en 0).
+patrón repetitivo). **Bajo el agua**, en el loop, los tres colapsan.
 
 ## 7. Trabajo futuro (Hito 3)
 
