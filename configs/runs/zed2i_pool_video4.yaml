@@ -12,8 +12,8 @@
 type: GeneralStereo
 name: zed2i_pool_video4
 args:
-  # Ruta absoluta a la carpeta con subdirs left/ y right/
-  root: /home/wildsense/Documents/development/s_dpvio/data/recordings/video_4_stereo
+  # Ruta a la carpeta con subdirs left/ y right/ (relativa al repo; coloca aquí tus datos)
+  root: data/recordings/video_4_stereo
 
   # Intrínsecos rectificados (LEFT == RIGHT por SDK)
   # Sensor full res 1920×1080 → scale 0.5 → 960×540

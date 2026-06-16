@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+# Salidas y datos (se generan / aportan localmente)
+results/
+data/
+# Upstream (se clona en Setup)
+third_party/
+# Artefactos
+*.zip
+.DS_Store

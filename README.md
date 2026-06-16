@@ -57,24 +57,57 @@ sobre el eje principal). Métricas: **ATE**, **RPE traslacional (1 m)**,
 (loop) las métricas honestas de **cierre de lazo** (`loop_closure_m`,
 `max_excursion_m`): el ATE along-track es ciego al colapso de un loop.
 
-## 4. Reproducir
+## 4. Setup (dejarlo listo para correr)
+
+Requisitos: Linux con GPU NVIDIA (CUDA), Python 3.8–3.10.
 
 ```bash
-# 1. Construir el GT TUM desde los timecodes de cintas
+# 1. Dependencias Python (instala la rueda torch +cuXXX acorde a tu CUDA)
+pip install -r requirements.txt
+
+# 2. Fork base de DPVO + NUESTRA modificación
+git clone https://github.com/MAC-VO/S_DPVO.git third_party/S_DPVO
+cd third_party/S_DPVO && git checkout f7266f7
+git apply ../../dpvo_metric/dpvo_metric.patch     # nuestra modificación (escala métrica)
+cp ../../dpvo_metric/config/*.yaml config/         # nuestros configs
+pip install . --no-build-isolation                 # compila extensiones CUDA
+cd ../..   # (ver el README del fork para deps de build: lietorch, etc.)
+
+# 3. Pesos DPVO (14 MB) -> third_party/S_DPVO/weights/dpvo.pth
+#    https://www.dropbox.com/s/nap0u8zslspdwm4/models.zip  (contiene dpvo.pth)
+#    sha256(dpvo.pth)=30d02dc2b88a321cf99aad8e4ea1152a44d791b5b65bf95ad036922819c0ff12
+mkdir -p third_party/S_DPVO/weights   # descomprime dpvo.pth aquí
+
+# 4. (opcional) ZED SDK 5.x de Stereolabs -> trae pyzed. Solo para el baseline
+#    ZED PT (run_zed_pt.py) y la conversión SVO->PNG. No se instala por pip.
+
+# 5. Datos: coloca tus secuencias en data/recordings/ (los configs/runs/*.yaml
+#    apuntan ahí, relativos). Convierte un SVO a pares estéreo con:
+python scripts/svo_to_stereo_pngs.py --svo tu_video.svo \
+    --out data/recordings/mi_seq --scale 0.75
+```
+
+> El repo **no incluye** el código upstream (DPVO/MAC-VO), los pesos ni los
+> datos (pesados / con licencia propia): los pasos de arriba los obtienen.
+> Atribución en [`NOTICE.md`](NOTICE.md).
+
+## 5. Reproducir
+
+```bash
+# a) GT TUM desde los timecodes de cintas
 python eval/build_gt_tum.py --config configs/tape_timecodes.yaml --out results/gt/
 
-# 2. Correr DPVO métrico (tras aplicar dpvo_metric/dpvo_metric.patch sobre
-#    el fork base — ver dpvo_metric/README.md; requiere torch+CUDA y pyzed)
+# b) DPVO métrico (nuestra modificación)
 python scripts/run_sdpvo_metric.py --config configs/runs/zed2i_gym_video1.yaml \
     --inject prior_insolver --prior-strength 1000
 
-# 3. Evaluar contra el GT
+# c) Evaluar contra el GT (ATE along-track + cierre de lazo)
 python eval/eval_ate_tape_gt.py \
     --gt results/gt/gym_video_1_gt_tum.txt \
     --est results/<run_dir>/trajectory.txt --json out.json
 ```
 
-## 5. Resultados (resumen)
+## 6. Resultados (resumen)
 
 | Secuencia | DPVO métrico (ATE) | MAC-VO | ZED PT |
 |---|---|---|---|
@@ -87,15 +120,6 @@ python eval/eval_ate_tape_gt.py \
 evaluados; la ventaja crece a corta distancia de la malla (aliasing del
 patrón repetitivo). **Bajo el agua**, en el loop, los tres colapsan
 (cierre de lazo 3.8–4.9 m sobre un recorrido que debía cerrar en 0).
-
-## 6. Dependencias upstream (no incluidas aquí)
-
-- **DPVO** — `princeton-vl/DPVO` (pesos `dpvo.pth`).
-- **MAC-VO** — `MAC-VO/MAC-VO` (paper Qiu et al. 2025).
-- **ZED SDK** 5.x + `pyzed` (Stereolabs).
-- **evo** — evaluación de trayectorias.
-
-Ver `requirements.txt` y `MANIFEST.md`.
 
 ## 7. Trabajo futuro (Hito 3)
 
