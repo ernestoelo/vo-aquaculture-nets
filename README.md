@@ -111,12 +111,26 @@ python eval/eval_ate_tape_gt.py \
 
 ### ATE — error de posición (alineamiento rígido, sin escala)
 
-| Secuencia | DPVO métrico (ATE) | MAC-VO | ZED PT |
+DPVO métrico se reporta como la **corrida de ATE mediano de N=3** (no la mejor),
+igual que el informe; el ruido del GT (~±0.2 m por cinta) vuelve no
+significativas las diferencias < 0.1 m.
+
+| Secuencia | DPVO métrico (ATE, mediana N=3) | MAC-VO | ZED PT |
 |---|---|---|---|
-| gym_v1 (aire, ~2 m malla) | **0.114 m** | 0.258 | 1.161 |
+| gym_v1 (aire, ~2 m malla) | **0.135 m** | 0.258 | 1.161 |
 | gym_v2 (aire, ~1 m malla) | **0.257 m** | 1.771 | 2.664 |
-| gym_v3 (aire, ~0.5 m malla) | **0.274 m** | 1.449 | 1.991 |
+| gym_v3 (aire, ~0.5 m malla) | **0.330 m** | 1.449 | 1.991 |
 | video_4 (agua, loop) | 2.382 m\* | 3.007\* | 2.660\* |
+
+> **El ATE centrado subestima el colapso, también en aire.** El ATE alinea
+> cada serie solo en *offset* (resta la media; convención `evo`/Umeyama), así
+> que a un MAC-VO/ZED PT colapsado en gym_v2/v3 lo deja *flotando* en la mitad
+> del GT y su ATE (1.77/1.45 m MAC-VO; 2.66/1.99 m ZED PT) **parece moderado**.
+> La magnitud real del fallo es la **deriva**: MAC-VO 74.9 % / 73.8 % y ZED PT
+> 104 % / 86.8 % en gym_v2/v3 (≈ varios metros de error neto), frente a la
+> deriva ≤ 5.3 % de DPVO métrico. Es el **mismo fenómeno que en el loop** (ver
+> abajo): para trayectorias colapsadas pero cortas, leer el ATE **junto a la
+> deriva**, no de forma aislada.
 
 \* **En un *loop* (ida y vuelta) el ATE along-track es ciego al colapso**:
 centra y proyecta a 1-D, y la deriva se diluye porque el desplazamiento
