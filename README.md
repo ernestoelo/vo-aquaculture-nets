@@ -155,17 +155,21 @@ pierde por completo. Expresado como deriva honesta (cierre / recorrido de
 
 ### Recorrido (path length) por video — DPVO métrico crudo
 
+Cifras del Cuadro III del informe (corrida de ATE mediano de N=3). GT = camino
+de referencia (en `video_4` el loop recorre ~9 m de ida + ~9 m de vuelta = 18 m).
+
 | Secuencia | Path estimado | GT | Path / GT |
 |---|---|---|---|
-| gym_v1 (aire) | ~12 m | ~10 m | 1.2× |
-| gym_v2 (aire) | ~17 m | ~10 m | 1.7× |
-| gym_v3 (aire) | ~17 m | ~10 m | 2.5× |
-| **video_4 (agua, loop)** | **~50 m** | 18 m | **~10×** |
+| gym_v1 (aire) | 14.2 m | 8.9 m | 1.6× |
+| gym_v2 (aire) | 17.4 m | 9.0 m | 1.9× |
+| gym_v3 (aire) | 18.4 m | 8.0 m | 2.3× |
+| **video_4 (agua, loop)** | **50.2 m** | 18.0 m | **2.8×** |
 
 El exceso sobre el GT es **temblor de alta frecuencia** (un filtro Savitzky–Golay
-lo reduce sin cambiar el ATE). En aire es modesto (1.2–2.5×); en `video_4` el
-recorrido se dispara a **~50 m sobre un loop de 18 m** (~10× el neto): es el
-**peor caso del benchmark** y la firma del colapso subacuático.
+lo reduce sin cambiar el ATE). En aire es modesto (1.6–2.3×); en `video_4` el
+recorrido se dispara a **50 m sobre un loop de 18 m** (path/GT 2.8×, pero **~10×
+el desplazamiento neto** de 4.9 m): es el **peor caso del benchmark** y la firma
+del colapso subacuático.
 
 **En aire** nuestra modificación supera a los métodos del estado del arte
 evaluados; la ventaja crece a corta distancia de la malla (aliasing del
