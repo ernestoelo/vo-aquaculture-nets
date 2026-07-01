@@ -1,19 +1,21 @@
-# Benchmarking de Odometría Visual para Mallas de Acuicultura — Hito 2 (IPD441)
+# Odometría Visual para Mallas de Acuicultura: Hitos 2 y 3 (IPD441)
 
-Entrega de código del Hito 2: implementación y evaluación comparativa de
-algoritmos de odometría visual (VO) sobre mallas de acuicultura con una
-cámara estéreo ZED 2i, en aire y bajo el agua.
+Entrega de código de los Hitos 2 y 3: evaluación comparativa de algoritmos
+de odometría visual (VO) sobre mallas de acuicultura con una cámara
+estéreo ZED 2i, en aire y bajo el agua (Hito 2), y la mejora del Hito 3:
+**fusión inercial tight-coupling** con la IMU de la misma cámara, que
+ancla el rumbo al giroscopio dentro del bundle adjustment (sección 7).
 
-**Autores:** Ernesto Gamero, Fernanda Quintana — UTFSM.
+**Autores:** Ernesto Gamero, Fernanda Quintana, UTFSM.
 **Informe:** el PDF escrito (formato IEEE-conf) se entrega por separado; este repositorio contiene el código de reproducción y evaluación.
 
 ## Estructura
 
 ```
-dpvo_metric/   NUESTRA modificación de DPVO (escala métrica): patch + src/ + configs
-scripts/       scripts de corrida de los 4 modelos (DPVO mono/métrico, MAC-VO prep, ZED PT)
-eval/          marco de evaluación (ATE along-track + cierre de lazo)
-configs/       ground truth de cintas + configs de corrida por secuencia
+dpvo_metric/   NUESTRA modificación de DPVO (escala métrica + factor IMU): patch + src/ + configs
+scripts/       corrida de los modelos, extracción de IMU del SVO, demo on/off (.rrd / .mp4)
+eval/          marco de evaluación (ATE along-track + cierre de lazo + rumbo vs giroscopio)
+configs/       ground truth (cintas y giros) + calibración + configs por secuencia
 NOTICE.md      atribución de terceros (DPVO MIT, MAC-VO, ZED SDK)
 ```
 
@@ -21,12 +23,14 @@ NOTICE.md      atribución de terceros (DPVO MIT, MAC-VO, ZED SDK)
 
 ## 1. Qué se evalúa
 
-Cuatro configuraciones sobre la misma cámara y los mismos datos:
+Cinco configuraciones sobre la misma cámara y los mismos datos (la
+quinta, DPVO métrico + IMU, es la mejora del Hito 3, sección 7):
 
 | Modelo | Qué es | Escala | fps (x86 RTX 3060) |
 |---|---|---|---|
 | **DPVO mono** | DPVO monocular [Teed 2023], punto de partida | arbitraria | ~27 |
 | **DPVO métrico** | **nuestra modificación**: prior de profundidad estéreo *in-solver* | métrica | ~19 (6.1 embarcado) |
+| **DPVO métrico + IMU** | **mejora Hito 3**: factor inercial *tight-coupling* en el BA | métrica | ~15 |
 | **MAC-VO** | estado del arte estéreo + covarianza [Qiu 2025, ICRA Best Paper] | métrica | ~1.2 |
 | **ZED SDK PT** | *positional tracking* del SDK (visión + IMU), referencia industrial | métrica | tiempo real (Jetson) |
 
@@ -42,10 +46,12 @@ E_prior = Σ_p  w_p · ( d_p − 1/Z_zed,p )²
 
 sumado al residuo de reproyección. Anclar la profundidad *dentro* de la
 optimización (no como reescalado posterior) recupera una escala estable.
-**El código de la modificación está en [`dpvo_metric/`](dpvo_metric/)**:
-el patch (`dpvo_metric.patch`, 484 líneas sobre `MAC-VO/S_DPVO@f7266f7`),
-los archivos modificados completos (`src/`) y los configs. Ver
-[`dpvo_metric/README.md`](dpvo_metric/README.md) para dónde está cada cambio.
+En el Hito 3 el mismo solver se extendió con un **factor inercial de
+preintegración** (sección 7). **El código de la modificación está en
+[`dpvo_metric/`](dpvo_metric/)**: el patch (`dpvo_metric.patch`, 1360
+líneas sobre `MAC-VO/S_DPVO@f7266f7`), los archivos modificados completos
+(`src/`) y los configs. Ver [`dpvo_metric/README.md`](dpvo_metric/README.md)
+para dónde está cada cambio y la matemática de ambos factores.
 
 ## 3. Métricas
 
@@ -94,11 +100,13 @@ python scripts/svo_to_stereo_pngs.py --svo tu_video.svo \
 ## 5. Reproducir
 
 ```bash
-# a) GT TUM desde los timecodes de cintas
-python eval/build_gt_tum.py --config configs/tape_timecodes.yaml --out results/gt/
+# a) GT TUM desde los timecodes de cintas (configs/gt/tape_timecodes.yaml)
+python eval/build_gt_tum.py --out-dir results/gt/
 
-# b) DPVO métrico (nuestra modificación)
-python scripts/run_sdpvo_metric.py --config configs/runs/zed2i_gym_video1.yaml \
+# b) DPVO métrico (nuestra modificación) sobre un SVO
+python scripts/run_sdpvo_metric.py --svo data/recordings/<video>.svo2 \
+    --calib configs/calib/<calib>.txt \
+    --config-sdpvo third_party/S_DPVO/config/sweep_p24_ow3_lt6.yaml \
     --inject prior_insolver --prior-strength 1000
 
 # c) Evaluar contra el GT (ATE along-track + cierre de lazo)
@@ -109,7 +117,7 @@ python eval/eval_ate_tape_gt.py \
 
 ## 6. Resultados (resumen)
 
-### ATE — error de posición (alineamiento rígido, sin escala)
+### ATE: error de posición (alineamiento rígido, sin escala)
 
 DPVO métrico se reporta como la **corrida de ATE mediano de N=3** (no la mejor),
 igual que el informe; el ruido del GT (~±0.2 m por cinta) vuelve no
@@ -138,7 +146,7 @@ neto debería ser ≈0. La cifra de aspecto moderado (2.382 m) **no comunica**
 que la trayectoria no regresa. La métrica honesta es el **error de cierre
 de lazo**:
 
-### Cierre de lazo — video_4 (la métrica honesta del loop)
+### Cierre de lazo en video_4 (la métrica honesta del loop)
 
 | Modelo | Cierre ‖fin−inicio‖ | Excursión máx / GT | Path recorrido | Escala GT/est |
 |---|---|---|---|---|
@@ -153,7 +161,7 @@ pierde por completo. Expresado como deriva honesta (cierre / recorrido de
 18 m) es **27 %** (DPVO métrico) y **21 %** (MAC-VO), no el engañoso
 16.9 / 15.2 % que daría la fórmula estándar sobre un loop.
 
-### Recorrido (path length) por video — DPVO métrico crudo
+### Recorrido (path length) por video: DPVO métrico crudo
 
 Cifras del Cuadro III del informe (corrida de ATE mediano de N=3). GT = camino
 de referencia (en `video_4` el loop recorre ~9 m de ida + ~9 m de vuelta = 18 m).
@@ -175,8 +183,81 @@ del colapso subacuático.
 evaluados; la ventaja crece a corta distancia de la malla (aliasing del
 patrón repetitivo). **Bajo el agua**, en el loop, los tres colapsan.
 
-## 7. Trabajo futuro (Hito 3)
+## 7. Mejora Hito 3: fusión inercial tight-coupling (demo IMU on/off)
 
-Fusión inercial con filtro de Kalman (recuperar el giro del loop) y
-restricciones de plano como anclaje geométrico frente al patrón repetitivo
-de la malla. Detalle en la sección final del informe.
+La debilidad central del Hito 2 era el **rumbo (heading)**: en secuencias
+con giro, la VO pura sobre-rota sobre la malla repetitiva y el recorrido
+se deforma. La mejora integra la **IMU de la ZED 2i (~406 Hz)** como
+**factor de preintegración (Forster et al. 2017) dentro del bundle
+adjustment** (tight coupling): el giroscopio ancla la rotación entre
+keyframes y el prior de profundidad sigue anclando la escala. Detalle de
+la implementación (jacobiano analítico, regularización de velocidad,
+desacople rumbo/escala con `--imu-sig-a`) en
+[`dpvo_metric/README.md`](dpvo_metric/README.md).
+
+### Reproducir el demo on/off
+
+Dataset: secuencias **en aire** con giro deliberado de ~130° (recorrido
+en V, cintas cada 1 m; GT en `configs/gt/gym_2026-06-30_giro_timecodes.yaml`).
+En nuestros SVO subacuáticos el giroscopio viene muerto (todo ceros), por
+eso el demo IMU es en aire por diseño.
+
+```bash
+# 1) extraer la IMU del SVO2 (imprime un gate de validez: tasa ~406 Hz y |g|~9.8)
+python scripts/extract_imu_svo.py data/recordings/<video>.svo2 --out results/imu/<seq>
+
+# 2) correr ON (con IMU) y OFF (VO pura, mismo comando sin los flags --imu*)
+python scripts/run_sdpvo_metric.py --svo data/recordings/<video>.svo2 \
+    --calib configs/calib/zed2i_gym_2026-06-30_hd720.txt \
+    --config-sdpvo third_party/S_DPVO/config/sweep_p24_ow3_lt6.yaml \
+    --inject prior_insolver --prior-strength 1000 --depth-mode NEURAL \
+    --stride 1 --skip 15 --scale 0.5 --smooth-window 9 \
+    --imu results/imu/<seq> --imu-strength 10 --imu-sig-a 15
+
+# 3) métrica líder: rumbo de la cámara vs giroscopio (gyro = verdad física)
+python eval/eval_heading_vs_gyro_gt.py
+
+# 4) demo visual: .rrd interactivo (Rerun) y .mp4 offline
+python scripts/onoff_to_rerun.py       # requiere rerun-sdk
+python scripts/onoff_demo_video.py     # requiere ffmpeg
+
+# (barrido de --imu-sig-a que fijó el punto de operación)
+bash scripts/run_imu_siga_sweep.sh && python eval/eval_imu_siga_sweep.py
+```
+
+### Resultado (N=3, secuencias gym con giro)
+
+Pico de rumbo en el giro, en grados (el giroscopio integrado es la
+referencia física, independiente de la visión):
+
+| Secuencia | Giroscopio | **IMU ON (tight)** | IMU OFF (VO pura) |
+|---|---|---|---|
+| v1 | 138 | **138** | -212 |
+| v2 | 127 | **128** | 220 |
+| v3 | -144 | **-145** | 251 |
+
+**ON sigue al giroscopio dentro de ~1° y vuelve a ~0 al cerrar el
+recorrido; OFF sobre-rota 210 a 251 grados y deriva.** Con el desacople
+`--imu-sig-a 15` la escala del plano queda además near-metric (0.93 /
+0.87 / 0.99 vs el GT de cintas), así que la planta ON reproduce la forma
+en V del recorrido real. El punto de operación validado es
+`--imu-strength 10 --imu-sig-a 15` (con `--imu-v-reg 10` default: 9/9
+runs sin divergencia).
+
+### Resultados negativos (documentados por honestidad)
+
+Antes de la IMU se evaluaron sistemáticamente **anclajes geométricos de
+plano** (coplanaridad in-solver, plano local por ventana, restricción
+vertical por gravedad) y un **front-end de triangulación estéreo
+dispersa**: todos negativos para esta geometría (la malla repetitiva
+aliasea el matching y la escena no es coplanar). El código queda en el
+patch con default OFF (flags `--plane-*` y `--stereo-*`) como registro
+del avance; el análisis está en el informe.
+
+## 8. Trabajo futuro
+
+El colapso subacuático restante es un problema de **flujo óptico** (tasa
+de refresco baja frente a la velocidad aparente de la malla), no del
+solver: la escalera siguiente es hardware (cámara global-shutter de mayor
+fps, brújula, sensor de profundidad) y grabar secuencias subacuáticas
+con giroscopio vivo para extender el demo IMU al agua.

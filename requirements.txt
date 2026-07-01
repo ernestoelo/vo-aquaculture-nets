@@ -7,17 +7,21 @@ matplotlib>=3.7
 scipy>=1.10          # smooth_trajectory.py (filtro Savitzky-Golay)
 evo>=1.28            # referencia de evaluación (el GT colineal usa el método along-track propio)
 
-# (2) PIPELINE DPVO métrico — la red corre sobre el fork DPVO (ver SETUP en
+# (2) PIPELINE DPVO métrico: la red corre sobre el fork DPVO (ver SETUP en
 #     README). torch/torchvision se instalan con la rueda CUDA correcta para
 #     tu GPU (https://pytorch.org); el fork DPVO trae sus extensiones CUDA.
 torch>=2.3            # instalar la rueda +cuXXX acorde a tu CUDA
 torchvision
-opencv-python>=4.8    # svo_to_stereo_pngs.py
+opencv-python>=4.8    # svo_to_stereo_pngs.py, stereo_triangulate.py, svo_to_mp4_gt.py
 einops                # dependencia del fork DPVO
 yacs                  # dependencia del fork DPVO (configs)
 
-# (3) ZED SDK — pyzed NO se instala por pip: viene con el instalador del
+# (3) ZED SDK: pyzed NO se instala por pip, viene con el instalador del
 #     ZED SDK de Stereolabs (https://www.stereolabs.com/developers).
-#     Sólo necesario para run_zed_pt.py (baseline ZED PT) y
-#     svo_to_stereo_pngs.py (conversión SVO -> PNGs estéreo).
+#     Sólo necesario para run_zed_pt.py (baseline ZED PT), extract_imu_svo.py
+#     (extracción IMU del SVO2) y las conversiones SVO -> PNG/mp4.
 # pyzed   (instalar vía ZED SDK, no pip)
+
+# (4) DEMO IMU on/off del Hito 3 (opcional, solo visualización)
+rerun-sdk==0.21.0     # onoff_to_rerun.py escribe el .rrd (verlo requiere el binario 'rerun')
+# ffmpeg              (binario del sistema, no pip: onoff_demo_video.py y svo_to_mp4_gt.py)
