@@ -227,22 +227,28 @@ bash scripts/run_imu_siga_sweep.sh && python eval/eval_imu_siga_sweep.py
 
 ### Resultado (N=3, secuencias gym con giro)
 
-Pico de rumbo en el giro, en grados (el giroscopio integrado es la
-referencia física, independiente de la visión):
+Métricas del demo, por secuencia. **Rumbo**: pico de heading en el giro,
+en grados; el giroscopio integrado es la referencia física, independiente
+de la visión, y `|Δ|` es el error de pico de ON contra él. **Escala**:
+mediana de la escala estimada/GT por brazos del recorrido (cintas cada
+1 m). **fps**: efectivo end-to-end en x86 RTX 3060 (HD720@60, escala 0.5,
+stride 1, 4400 a 5200 frames por secuencia). ON = tight coupling con el
+punto de operación `--imu-strength 10 --imu-sig-a 15`; OFF = VO pura
+métrica (mismo comando sin `--imu*`).
 
-| Secuencia | Giroscopio | **IMU ON (tight)** | IMU OFF (VO pura) |
-|---|---|---|---|
-| v1 | 138 | **138** | -212 |
-| v2 | 127 | **128** | 220 |
-| v3 | -144 | **-145** | 251 |
+| Secuencia | Gyro (pico) | **IMU ON: \|Δ\| vs gyro** | IMU OFF (pico) | Escala ON | fps ON | fps OFF |
+|---|---|---|---|---|---|---|
+| v1 | 138° | **1°** | -212° | 0.93 | 15.3 | 22.0 |
+| v2 | 127° | **0°** | 220° | 0.87 | 15.3 | 22.2 |
+| v3 | -144° | **0°** | 251° | 0.99 | 15.1 | 22.3 |
 
 **ON sigue al giroscopio dentro de ~1° y vuelve a ~0 al cerrar el
 recorrido; OFF sobre-rota 210 a 251 grados y deriva.** Con el desacople
-`--imu-sig-a 15` la escala del plano queda además near-metric (0.93 /
-0.87 / 0.99 vs el GT de cintas), así que la planta ON reproduce la forma
-en V del recorrido real. El punto de operación validado es
-`--imu-strength 10 --imu-sig-a 15` (con `--imu-v-reg 10` default: 9/9
-runs sin divergencia).
+`--imu-sig-a 15` la escala queda además near-metric (0.93 / 0.87 / 0.99),
+así que la planta ON reproduce la forma en V del recorrido real. El
+factor IMU cuesta ~31% de fps (22 a 15, unos 20 ms extra por frame en
+p50) gracias al jacobiano de pose analítico; con `--imu-v-reg 10`
+(default) los 9/9 runs corren sin divergencia.
 
 ### Resultados negativos (documentados por honestidad)
 
