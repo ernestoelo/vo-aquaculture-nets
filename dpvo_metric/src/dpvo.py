@@ -58,6 +58,60 @@ class DPVO:
         self.depth_prior_alpha = 0.0      # blend post-BA (modo "prior", gauge-libre)
         self.depth_prior_strength = 0.0   # factor unario in-solver (modo "prior_insolver")
 
+        # factor de plano in-solver (P2 Hito 3): plano cam-local `[n,d]` por frame
+        # (estimado fuera de la BA desde la nube estéreo validada — RANSAC en el
+        # runner) + validez. Alineado por slot con patches_ (se desplaza en
+        # keyframe()). En la BA se transforma a coords del MUNDO con la pose del
+        # frame de referencia y entra como restricción de coplanaridad BLANDA
+        # JUNTO al prior de depth (no en vez de él). Ver handoff 2026-06-18.
+        self.plane_n_ = torch.zeros(self.N, 3, device="cuda")    # normal cam-local (|n|=1)
+        self.plane_d_ = torch.zeros(self.N, device="cuda")       # offset cam-local
+        self.plane_w_ = torch.zeros(self.N, device="cuda")       # 1 si el frame tiene plano
+        self.plane_strength = 0.0         # fuerza del factor de plano (0 = off)
+        self.plane_trim = 0.0             # trim por distancia euclídea al plano (m)
+        self.plane_set_counter = 0        # ++ cada vez que el runner setea un plano
+        self._plane_world_cache = None    # π_world congelado entre refits
+        self._plane_world_cache_id = -1
+        # B1 (planos LOCALES por ventana): "frozen" = P2 (plano per-frame
+        # congelado, global); "window" = RANSAC fresco sobre los puntos 3-D de
+        # los parches de la ventana activa cada BA. Ver handoff B1 Hito 3.
+        self.plane_mode = "frozen"
+        self.plane_inlier_thresh = 0.08   # umbral RANSAC del plano de ventana (m)
+        # Gap 2 Hito 3 — plano VERTICAL por gravedad: si plane_vertical y plane_grav
+        # (3,) están seteados, el RANSAC del plano de ventana restringe las hipótesis
+        # a planos VERTICALES (normal ⊥ gravedad). La red de la jaula es vertical →
+        # quita 1 DOF a la normal ruidosa (que era la varianza que hundió a B1). Usa
+        # SOLO el acelerómetro (la gravedad mundo) → NO necesita gyro → corre en
+        # video_4 (gyro muerto). Ver finding 2026-06-20-underwater-svo-no-gyro.
+        self.plane_vertical = False
+        self.plane_grav = None            # (3,) gravedad en el mundo (frame 0 = identidad)
+
+        # tight coupling IMU (estrategia B Hito 3): velocidad body-en-mundo por
+        # keyframe (estado EXTRA de la BA aumentada) + timestamp real (ns) por slot
+        # para alinear con el stream IMU. Alineados con poses_; se desplazan en
+        # keyframe(). El stream IMU (frame cámara) y la gravedad mundo los setea el
+        # runner. El factor de preintegración vive en imu_preint.py + ba.py.
+        # Ver finding 2026-06-19-ekf-imu-loose-coupling + handoff tight coupling.
+        self.vels_ = torch.zeros(self.N, 3, device="cuda")
+        self.frame_ts_ = torch.zeros(self.N, dtype=torch.long, device="cuda")
+        self.imu_tight = False
+        self.imu_ts = None        # (Msamp,) long ns ORDENADO
+        self.imu_acc = None       # (Msamp,3) m/s² frame cámara
+        self.imu_gyr = None       # (Msamp,3) rad/s frame cámara
+        self.imu_g = None         # (3,) gravedad en el mundo (frame 0 = identidad)
+        self.imu_sig_g = 0.01     # ruido gyro (peso relativo del residual r_ΔR)
+        self.imu_sig_a = 0.2      # ruido acc  (peso de r_Δv / r_Δp)
+        self.imu_strength = 1.0   # fuerza global del factor IMU (como prior_strength)
+        # guard de divergencia (robustez, paso 1 Hito 3): cap físico de ‖v‖ que
+        # mata la dirección degenerada que infla la escala, + cap de paso de pose
+        # que cae a BA visual. 0=off. Ver finding tight-coupling-robustness.
+        self.imu_v_max = 0.0      # m/s; máx ‖v‖ de keyframe (proyección post-solve; REFUTADO)
+        self.imu_max_step = 0.0   # m; máx traslación de pose por paso (si no, fallback)
+        self.imu_v_reg = 0.0      # Tikhonov in-solver sobre ‖v‖ (anti-drift de escala)
+        self.imu_n_clamp = 0      # contador: velocidades acotadas
+        self.imu_n_reject = 0     # contador: pasos IMU rechazados (fallback visual)
+        self._preint_cache = {}   # (ts_i,ts_j) -> Preint (medidas fijas: se cachea)
+
         ### network attributes ###
         self.mem = 32
 
@@ -244,6 +298,11 @@ class DPVO:
                 self.patches_[i] = self.patches_[i+1]
                 self.disps_prior_[i] = self.disps_prior_[i+1]
                 self.disps_prior_w_[i] = self.disps_prior_w_[i+1]
+                self.plane_n_[i] = self.plane_n_[i+1]
+                self.plane_d_[i] = self.plane_d_[i+1]
+                self.plane_w_[i] = self.plane_w_[i+1]
+                self.vels_[i] = self.vels_[i+1]
+                self.frame_ts_[i] = self.frame_ts_[i+1]
                 self.intrinsics_[i] = self.intrinsics_[i+1]
 
                 self.imap_[i%self.mem] = self.imap_[(i+1) % self.mem]
@@ -370,6 +429,46 @@ class DPVO:
         blended = (1.0 - aw) * cur + aw * d_prior
         self.patches_[lo:hi, :, 2] = blended.clamp(min=1e-3, max=10.0)
 
+    def _body_pos(self, i):
+        """Posición de la cámara (body) en el mundo del slot i: p_wb = -R(G)ᵀ t(G),
+        con G = poses_[i] (world→cam)."""
+        M = SE3(self.poses_[i][None]).matrix()[0]
+        R = M[:3, :3]
+        t = M[:3, 3]
+        return -(R.transpose(-1, -2) @ t)
+
+    def _build_imu_factors(self, t0):
+        """Arma el dict de factores IMU para la BA aumentada (tight coupling):
+        preintegración entre cada par de keyframes consecutivos de la ventana
+        [t0-1, n) (incluye el borde fijo→libre). Devuelve None si no hay pares o
+        falta el stream IMU. Las medidas son fijas → la preintegración se cachea."""
+        from .imu_preint import segment_preint
+        if self.imu_ts is None or self.imu_g is None:
+            return None
+        n = self.n
+        lo = max(int(t0) - 1, 0)
+        if n - lo < 2:
+            return None
+        preints = []
+        cache = self._preint_cache
+        for i in range(lo, n - 1):
+            ti = int(self.frame_ts_[i]); tj = int(self.frame_ts_[i + 1])
+            if tj <= ti:
+                continue
+            key = (ti, tj)
+            pre = cache.get(key)
+            if pre is None:
+                pre = segment_preint(self.imu_ts, self.imu_acc, self.imu_gyr, ti, tj)
+                cache[key] = pre
+            preints.append((i, i + 1, pre))
+        if not preints:
+            return None
+        return {"preints": preints, "vels": self.vels_[:n], "g": self.imu_g,
+                "sig_g": self.imu_sig_g, "sig_a": self.imu_sig_a,
+                "strength": self.imu_strength,
+                "v_max": self.imu_v_max, "max_step": self.imu_max_step,
+                "v_reg": self.imu_v_reg}
+
     def _ba_python_prior(self, target, weight, t0):
         """Variante C in-solver: corre la BA de Python (`ba.py`) con un factor
         unario de profundidad DENTRO del solver (en vez de `fastba` + blend
@@ -386,16 +485,167 @@ class DPVO:
         prior_w = self.disps_prior_w_.view(-1)
         strength = float(getattr(self, "depth_prior_strength", 0.0))
         qboost = float(getattr(self, "depth_quality_boost", 1.0))
+        # factor de plano in-solver (P2): transforma el plano cam-local del frame
+        # de referencia a coords del MUNDO con su pose actual y lo mantiene FIJO
+        # durante el solve (alternancia a cadencia de frame). Ver handoff 2026-06-18.
+        plane_strength = float(getattr(self, "plane_strength", 0.0))
+        if plane_strength > 0:
+            if getattr(self, "plane_mode", "frozen") == "window":
+                plane = self._fit_window_plane(Gs, t0)   # B1: plano local fresco
+            else:
+                plane = self._world_plane(Gs)            # P2: plano per-frame congelado
+        else:
+            plane = None
+        plane_trim = float(getattr(self, "plane_trim", 0.0))
+        patch_anchor = self.ix if plane is not None else None
+        use_imu = bool(getattr(self, "imu_tight", False)) and self.is_initialized
         for _ in range(2):
-            Gs, patches = _pyBA(
+            imu = self._build_imu_factors(t0) if use_imu else None
+            out = _pyBA(
                 Gs, patches, self.intrinsics, target, weight, 1e-4,
                 self.ii, self.jj, self.kk, bounds, ep=10.0, fixedp=t0,
                 structure_only=False, prior_d=prior_d, prior_w=prior_w,
-                prior_strength=strength, quality_boost=qboost)
+                prior_strength=strength, quality_boost=qboost,
+                plane=plane, plane_strength=(plane_strength if plane is not None else 0.0),
+                plane_trim=plane_trim, patch_anchor=patch_anchor, imu=imu)
+            if imu is not None:
+                Gs, patches, vels_new = out
+                if vels_new is not None:
+                    self.vels_[:vels_new.shape[0]] = vels_new
+                self.imu_n_clamp += int(imu.get("_nclamp", 0))
+                self.imu_n_reject += int(imu.get("_reject", 0))
+            else:
+                Gs, patches = out
         self.poses_[:] = Gs.data[0]
         self.patches_[:] = patches.view(self.N, self.M, 3, self.P, self.P)
 
-    def __call__(self, tstamp, image, intrinsics, depth=None):
+    def _world_plane(self, Gs):
+        """Plano (4,) `[n,d]` en coords del MUNDO desde el plano cam-local del frame
+        de referencia (el más reciente con plano válido). El plano cam π_c cumple
+        π_c·X_cam=0 con X_cam=G·X_world (G mundo→cam) → π_world=Gᵀ·π_c. Devuelve None
+        si no hay plano válido.
+
+        **Plano FIJO + alternancia** (spec del handoff 2026-06-18): π_world se
+        CONGELA al setear un plano nuevo (contador `plane_set_counter` en __call__)
+        y se reusa entre refits, en vez de re-derivarlo cada update() desde la pose
+        (que evoluciona) del frame de referencia. Eso evita el "chase" de un plano
+        que salta frame a frame (que desestabilizaba y acotaba el strength útil).
+        La cadencia de refit la fija --plane-refit-every del runner.
+        """
+        cnt = int(getattr(self, "plane_set_counter", 0))
+        if (getattr(self, "_plane_world_cache_id", -1) == cnt
+                and getattr(self, "_plane_world_cache", None) is not None):
+            return self._plane_world_cache                 # congelado entre refits
+        valid = (self.plane_w_[:self.n] > 0).nonzero(as_tuple=False)
+        if valid.numel() == 0:
+            return None
+        f = int(valid[-1].item())                          # frame de referencia más reciente
+        pi_cam = torch.cat([self.plane_n_[f], self.plane_d_[f].view(1)])   # (4,)
+        M = Gs[:, f].matrix()[0]                            # (4,4) mundo→cam del frame f
+        pi_world = M.transpose(-1, -2) @ pi_cam            # (4,) plano en el mundo
+        self._plane_world_cache = pi_world
+        self._plane_world_cache_id = cnt
+        return pi_world
+
+    def _fit_window_plane(self, Gs, t0):
+        """B1 (planos LOCALES): ajusta un plano FRESCO por RANSAC a los puntos 3-D
+        de los parches de la VENTANA activa [t0, n) en coords del MUNDO, cada BA.
+        A diferencia de `_world_plane` (P2: un plano per-frame congelado/global), se
+        re-estima desde los puntos YA optimizados de la ventana → nunca obsoleto,
+        robusto al ruido per-frame, y respeta la geometría orbital (cada ventana de
+        la órbita ≈ un plano local). NO usa los buffers `plane_*` ni depth del SDK:
+        el plano sale de los propios parches anclados (selectos+texturados+con prior
+        de depth válido). Devuelve π=[n,d] (4,), |n|=1, o None. Ver handoff B1 Hito 3.
+        """
+        m = self.m
+        if m < 30:
+            return None
+        P = self.P
+        pc = pops.point_cloud(Gs, self.patches[:, :m], self.intrinsics, self.ix[:m])
+        pts4 = pc[0, :, P // 2, P // 2, :]                 # (m, 4) homogéneo [X,Y,Z,W=1/Z]
+        w = pts4[:, 3]
+        xyz = pts4[:, :3] / w.clamp(min=1e-6)[:, None]     # (m, 3) euclídeo en el mundo
+        anchor = self.ix[:m]
+        pw = self.disps_prior_w_.view(-1)[:m]
+        sel = ((anchor >= t0) & (anchor < self.n) & (pw > 0) & (w > 1e-6)
+               & torch.isfinite(xyz).all(-1))
+        Q = xyz[sel]
+        if Q.shape[0] < 30:
+            return None
+        grav = (self.plane_grav if bool(getattr(self, "plane_vertical", False))
+                and getattr(self, "plane_grav", None) is not None else None)
+        return self._ransac_plane(
+            Q, iters=64, thresh=float(getattr(self, "plane_inlier_thresh", 0.08)),
+            grav=grav)
+
+    @staticmethod
+    def _ransac_plane(pts, iters=64, thresh=0.08, grav=None):
+        """RANSAC de plano sobre (K,3) torch → π=[n,d] (4,), |n|=1, n·X+d=0; refit
+        SVD sobre inliers. None si no converge (<20 inliers).
+
+        Si `grav` (3,) no es None, restringe las hipótesis a planos VERTICALES
+        (normal ⊥ gravedad): la red de la jaula cuelga vertical → quita 1 DOF a la
+        normal y elimina la libertad del RANSAC de inclinarse a ajustar el "queso
+        suizo"/alias (que era la varianza que hundió a B1). Gap 2 Hito 3 — usa solo
+        el acelerómetro (no necesita gyro). El hipótesis vertical desde 2 puntos a,b:
+        n = (b−a) × ĝ (⊥ gravedad y contiene a,b); el refit fuerza la normal al
+        subespacio horizontal ⊥ ĝ (PCA 2-D de menor varianza)."""
+        K = pts.shape[0]
+        ghat = None
+        if grav is not None:
+            gn = grav.norm()
+            if gn < 1e-9:
+                grav = None
+            else:
+                ghat = (grav / gn).to(pts)
+        best_inl, best_c = None, -1
+        for _ in range(iters):
+            if ghat is not None:
+                idx = torch.randint(0, K, (2,), device=pts.device)
+                a, b = pts[idx[0]], pts[idx[1]]
+                nrm = torch.cross(b - a, ghat, dim=-1)    # ⊥ gravedad y contiene a,b
+                anchor = a
+            else:
+                idx = torch.randint(0, K, (3,), device=pts.device)
+                a, b, c = pts[idx[0]], pts[idx[1]], pts[idx[2]]
+                nrm = torch.cross(b - a, c - a, dim=-1)
+                anchor = a
+            nn = nrm.norm()
+            if nn < 1e-9:
+                continue
+            nrm = nrm / nn
+            d = -(nrm * anchor).sum()
+            inl = ((pts * nrm).sum(-1) + d).abs() < thresh
+            cnt = int(inl.sum())
+            if cnt > best_c:
+                best_c, best_inl = cnt, inl
+        if best_inl is None or best_c < 20:
+            return None
+        Qc = pts[best_inl]
+        cen = Qc.mean(0)
+        if ghat is not None:
+            # refit VERTICAL: normal en el subespacio horizontal ⊥ gravedad (PCA 2-D)
+            ref = torch.tensor([1.0, 0.0, 0.0], device=pts.device, dtype=pts.dtype)
+            e1 = torch.cross(ghat, ref, dim=-1)
+            if e1.norm() < 1e-6:
+                ref = torch.tensor([0.0, 1.0, 0.0], device=pts.device, dtype=pts.dtype)
+                e1 = torch.cross(ghat, ref, dim=-1)
+            e1 = e1 / e1.norm()
+            e2 = torch.cross(ghat, e1, dim=-1); e2 = e2 / e2.norm()
+            B = torch.stack([e1, e2], 0)                   # (2,3) base horizontal
+            XY = (Qc - cen) @ B.T                           # (K,2) proyección horizontal
+            _, _, Vh = torch.linalg.svd(XY, full_matrices=False)
+            n2 = Vh[-1]                                     # (2,) dir. de menor varianza
+            nrm = n2[0] * e1 + n2[1] * e2
+            nrm = nrm / nrm.norm()
+        else:
+            _, _, Vh = torch.linalg.svd(Qc - cen, full_matrices=False)
+            nrm = Vh[-1]
+            nrm = nrm / nrm.norm()
+        d = -(nrm * cen).sum()
+        return torch.cat([nrm, d.view(1)]).to(pts)
+
+    def __call__(self, tstamp, image, intrinsics, depth=None, plane=None, frame_ts=None):
         """ track new frame """
 
         if (self.n+1) >= self.N:
@@ -416,6 +666,8 @@ class DPVO:
         ### update state attributes ###
         self.tlist.append(tstamp)
         self.tstamps_[self.n] = self.counter
+        if frame_ts is not None:
+            self.frame_ts_[self.n] = int(frame_ts)   # tiempo real (ns) p/ IMU
         self.intrinsics_[self.n] = intrinsics / self.RES
 
         # color info for visualization
@@ -437,6 +689,16 @@ class DPVO:
                 tvec_qvec = self.poses[self.n-1]
                 self.poses_[self.n] = tvec_qvec
 
+        # --- init de velocidad body-en-mundo (tight coupling): diferencia finita
+        # de la posición VO del frame anterior. Es solo semilla; la BA aumentada
+        # la refina como variable libre. ---
+        if self.imu_tight and self.n >= 1 and frame_ts is not None:
+            dt = (int(self.frame_ts_[self.n]) - int(self.frame_ts_[self.n-1])) / 1e9
+            if dt > 1e-4:
+                self.vels_[self.n] = (self._body_pos(self.n) - self._body_pos(self.n-1)) / dt
+            else:
+                self.vels_[self.n] = self.vels_[self.n-1]
+
         # --- siembra de profundidad inversa de los parches (init de escala) ---
         # Default DPVO: profundidad inversa aleatoria -> escala-ambiguo (mono).
         # Inyección métrica opcional: si se entrega `depth` (metros, misma
@@ -456,6 +718,15 @@ class DPVO:
                 # unario DENTRO de la BA de Python (rompe el gauge).
                 self.disps_prior_[self.n] = d_seed.view(self.M)
                 self.disps_prior_w_[self.n] = valid_seed.float()
+            # factor de plano in-solver (P2): el runner entrega el plano cam-local
+            # `[n0,n1,n2,d]` (RANSAC sobre la nube estéreo validada). Se guarda por
+            # frame; la BA lo lleva a coords del mundo con la pose del frame.
+            if (inject_mode == "prior_insolver") and (plane is not None):
+                pl = torch.as_tensor(plane, dtype=torch.float, device="cuda").view(4)
+                self.plane_n_[self.n] = pl[:3]
+                self.plane_d_[self.n] = pl[3]
+                self.plane_w_[self.n] = 1.0
+                self.plane_set_counter += 1     # invalida el caché de π_world (refit)
         else:
             patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
             if self.is_initialized:

@@ -1,0 +1,142 @@
+# gym_2026-06-30_giro_timecodes.yaml — Ground truth del dataset gym
+# "girodemarcado" (trío N=3, U-path + giro), anotado por el usuario el
+# 2026-06-30 mirando los MP4 con frame#/segundos quemados
+# (results/mp4_gt/girodemarcado_v{1,2,3}.mp4, generados por
+# scripts/svo_to_mp4_gt.py).
+#
+# CONVERSIÓN segundos -> frame_index: frame = round(t_s * fps), con fps = 60.
+# Ese frame_index ES la columna 0 de trajectory.txt (grab_index absoluto del
+# SVO, 0-based). NO hay que descontar el --skip: las trayectorias arrancan en
+# col0 = 15, pero el mapeo es por VALOR de col0, no por posición de fila.
+#
+# GEOMETRÍA (validada con el usuario 2026-06-30): la MALLA FÍSICA está montada
+# en U (esto es la forma de la RED, no la del recorrido caminado — ese es un
+# TRIÁNGULO/V, ver bloque FORMA DE LA PLANTA abajo). Cintas naranjas
+# cada 1 m. Las cintas 4 y 5 quedaron amarradas en las DOS esquinas de la U, de
+# modo que el giro ocurre entre la cinta 3 (ida) y la cinta 6 (vuelta) y esas
+# dos cintas NO se cronometran (caen en pleno giro). La U no es perfecta: entre
+# la cinta 5 y la 6 hay un tramo corto (~1 m) extra.
+#
+#   posición a lo largo de la malla (m, desde cinta 1):
+#     cinta 1=0  2=1  3=2  [4=3 esquina]  [5=4 esquina]  6=5  7=6  8=7
+#   brazo A recto = cintas 1·2·3·4 ; brazo B recto = cintas 5·6·7·8
+#
+# FORMA DE LA PLANTA (validada con el usuario 2026-06-30, para el GT de las
+# figuras cenitales): el recorrido dibuja un TRIÁNGULO / "V" invertida — el
+# CUERPO avanza recto por una pierna (~3.5 m), GIRA ~130° en el ápice (esquina,
+# entre cinta 3 y 6) y regresa por la otra pierna. NO es recto (la cámara no solo
+# paneó: el cuerpo sí dobló ~130°) ni una U de brazos paralelos. El GT de la
+# planta se construye así en scripts/make_planta_reframed_girodemarcado.py.
+# FUENTE ÚNICA de la forma (+ interpretaciones descartadas + reconciliación
+# U/triángulo): docs/findings/2026-07-01-gym-girodemarcado-gt-path-shape-triangle.md
+#
+# RECORRIDO: ida (cinta1->8 pasando por el giro) -> media vuelta de 180°
+# ("comienzo de vuelta") -> regreso retrazando (cinta8->1). Recorrido real
+# ~16 m (4+4+4+4), vuelve casi al punto de partida.
+#
+# ANCLAS DE ESCALA (euclídeas, inmunes al jitter porque unen puntos colineales
+# del mismo brazo recto): cinta1<->cinta3 = 2 m, cinta6<->cinta8 = 2 m, etc.
+#
+# RECORTE: 'inicio' y 'final'/'fin' acotan el tramo útil; fuera de ahí está la
+# basura de caminar al laptop a iniciar/detener y posicionar la ZedBox/cámara
+# en el suelo. Recortar a [frame(inicio), frame(final)] ANTES de medir.
+#
+# Precisión: timecodes leídos a ojo del usuario (±0.5 s estimado).
+# Handoff: docs/handoffs/2026-06-30-hito3-onoff-n3-heading-positive-next-gt-mp4.md
+#
+# OJO frames_total (verificado 2026-07-01): los valores de abajo vienen de la
+# metadata pyzed (get_svo_number_of_frames) que SOBRE-CUENTA. Los frames
+# REALES (grab exitosos, contiguos 0..N-1 según frame_times.csv) son:
+# v1=4455, v2=4545, v3=5244. Por eso posición-en-MP4 == grab_index == col0 de
+# trajectory.txt, SIN drift (no hubo drops a mitad del video). Detalle:
+# docs/findings/2026-07-01-hito3-onoff-rrd-demo-generated.md
+
+meta:
+  dataset: gym_girodemarcado (U-path + giro 180° planeado)
+  fecha_grabacion: 2026-06-30
+  camara: ZED 2i SN 34111953 (aire)
+  config_captura: HD720 @ 60 fps
+  fps: 60
+  tape_spacing_m: 1.0
+  tape_positions_m: {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7}
+  corners_at_tapes: [4, 5]      # esquinas de la U (no cronometradas)
+  gt_total_path_m: [15.0, 17.0] # ~16 m, 4+4+4+4, vuelve casi al inicio
+  giro_planeado_deg: 180        # el PLAN; el giro EJECUTADO del ápice fue
+                                # ~130° (mediana; picos 127-144° por video, gyro)
+  straight_arm_anchors:          # pares colineales para verificar escala
+    - {a: 1, b: 3, dist_m: 2.0}  # brazo A
+    - {a: 6, b: 8, dist_m: 2.0}  # brazo B
+    - {a: 6, b: 7, dist_m: 1.0}  # brazo B
+
+# Cada video: timecodes en SEGUNDOS. Los eventos de la VUELTA (retorno) se
+# sufijan _v para distinguirlos del paso de ida por la misma cinta.
+# trim_frames se da ya convertido (round(t*60)) por conveniencia.
+
+gym_girodemarcado_v1:
+  svo: data/recordings/2026-06-30__rec__u_giro180_gym_girodemarcado_v1.svo2
+  frames_total: 4456
+  trim_frames: [420, 3570]      # inicio 7.0 s -> 420 ; final 59.5 s -> 3570
+  ida:                           # {cinta: t_s}
+    inicio: 7.0
+    1: 8.4
+    2: 12.0
+    3: 16.0
+    giro: 17.0
+    6: 24.0
+    7: 29.0
+    8: 33.0
+  comienzo_vuelta: 34.5
+  vuelta:
+    7: 38.0
+    6: 42.0
+    giro: 47.5
+    3: 50.1
+    2: 52.9
+    1: 57.0
+    final: 59.5
+
+gym_girodemarcado_v2:
+  svo: data/recordings/2026-06-30__rec__u_giro180_gym_girodemarcado_v2.svo2
+  frames_total: 4575
+  trim_frames: [404, 3780]      # inicio 6.73 s -> 404 ; final 63.0 s -> 3780
+  ida:
+    inicio: 6.73
+    1: 8.5
+    2: 12.8
+    3: 16.3
+    giro: 16.8
+    6: 24.0
+    7: 28.8
+    8: 33.0
+  comienzo_vuelta: 34.5
+  vuelta:
+    7: 40.0
+    6: 45.0
+    giro: 50.3
+    3: 53.0
+    2: 56.0
+    1: 60.4
+    final: 63.0
+
+gym_girodemarcado_v3:
+  svo: data/recordings/2026-06-30__rec__u_giro180_gym_girodemarcado_v3.svo2
+  frames_total: 5245
+  trim_frames: [420, 3780]      # inicio 7.0 s -> 420 ; fin 63.0 s -> 3780
+  ida:
+    inicio: 7.0
+    1: 9.0
+    2: 13.0
+    3: 17.0
+    giro: 17.8
+    6: 26.3
+    7: 32.0
+    8: 36.5
+  comienzo_vuelta: 38.0
+  vuelta:
+    7: 42.6
+    6: 47.7
+    giro: 51.5
+    3: 53.5
+    2: 57.0
+    1: 61.1
+    final: 63.0

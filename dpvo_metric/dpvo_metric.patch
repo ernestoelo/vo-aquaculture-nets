@@ -1,5 +1,5 @@
 diff --git a/dpvo/ba.py b/dpvo/ba.py
-index ace7163..551d7a2 100644
+index ace7163..79c4d12 100644
 --- a/dpvo/ba.py
 +++ b/dpvo/ba.py
 @@ -13,13 +13,27 @@ class CholeskySolver(torch.autograd.Function):
@@ -32,13 +32,197 @@ index ace7163..551d7a2 100644
          ctx.save_for_backward(U, xs)
          ctx.failed = False
  
-@@ -83,8 +97,19 @@ def block_show(A):
+@@ -83,11 +97,218 @@ def block_show(A):
      plt.imshow(A[0].detach().cpu().numpy())
      plt.show()
  
 -def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False):
 -    """ bundle adjustment """
-+def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False, prior_d=None, prior_w=None, prior_strength=0.0, quality_boost=1.0):
++
++def _plane_factor(poses, patches, intrinsics, plane, kx, patch_anchor, p):
++    """Residual de coplanaridad homogéneo + jacobianos (factor de plano in-solver,
++    P2 Hito 3). El plano `π=[n,d]` (coords del MUNDO/frame 0) restringe la posición
++    3-D de cada parche único `kx` a ser coplanar: `r = π·X_world`, con
++    `X_world = G_ancla⁻¹·X0` (X0 = retroproyección homogénea del centro del parche
++    en su frame ancla). En coords homogéneas el residual es LINEAL en X_world →
++    reusa los mismos generadores que `pops.transform` (Ja homogéneo + 4ª columna
++    de la matriz como ∂X/∂d) y el mismo truco del adjunto para la pose ancla.
++
++    Devuelve:
++      r  (1, m)       residual homogéneo π·X_world (= W·dist_euclídea al plano)
++      W  (1, m)       4ª coord homogénea (profundidad inversa en mundo) p/ trim
++      Jp (1, m, 1, 6) ∂r/∂(pose ancla)  (perturbación izq. lietorch, como `Ji`)
++      Jd (1, m, 1, 1) ∂r/∂(profundidad inversa del parche)
++    Ver handoff docs/handoffs/2026-06-18-p2-stereo-frontend-evaluated-next-insolver-plane.md.
++    """
++    m = kx.shape[0]
++    anchor = patch_anchor[kx]                                   # (m,) frame ancla
++    X0 = pops.iproj(patches[:, kx], intrinsics[:, anchor])      # (1, m, P, P, 4)
++    X0c = X0[:, :, p // 2, p // 2, :]                           # (1, m, 4) centro
++    Giw = poses[:, anchor].inv()                                # (1, m) SE3 mundo<-ancla
++    Miw = Giw.matrix()                                          # (1, m, 4, 4)
++    Xw = torch.matmul(Miw, X0c[..., None]).squeeze(-1)          # (1, m, 4) punto mundo (homog)
++
++    pl = plane.view(1, 1, 4).to(Xw)
++    r = (pl * Xw).sum(-1)                                       # (1, m)
++    W = Xw[..., 3]                                              # (1, m)
++
++    # ∂X_world/∂d = 4ª columna de Miw (porque ∂X0/∂d = [0,0,0,1])
++    Jd = (pl * Miw[..., :, 3]).sum(-1)[..., None, None]         # (1, m, 1, 1)
++
++    # generador homogéneo en X_world (idéntico al `Ja` de pops.transform)
++    X, Y, Z, H = Xw.unbind(-1)
++    o = torch.zeros_like(H)
++    Ja = torch.stack([
++        H, o, o,  o,  Z, -Y,
++        o, H, o, -Z,  o,  X,
++        o, o, H,  Y, -X,  o,
++        o, o, o,  o,  o,  o,
++    ], dim=-1).view(1, m, 4, 6)
++    Jposej = (pl.view(1, 1, 4, 1) * Ja).sum(2)[:, :, None, :]   # (1, m, 1, 6) lado mundo
++    Jp = -Giw[:, :, None].adjT(Jposej)                          # (1, m, 1, 6) lado ancla
++    return r, W, Jp, Jd
++
++
++def _solve_augmented_imu(S, y, poses, imu, fixedp, nprime, ep, lm=1e-4):
++    """Resuelve el sistema reducido de pose VISUAL (S, y) AUMENTADO con el factor
++    inercial de preintegración (tight coupling, estrategia B Hito 3).
++
++    El estado libre = poses[fixedp:n] (6 c/u) ⊕ velocidades[fixedp:n] (3 c/u),
++    ordenado [todas las poses | todas las velocidades] → D = nprime*9. Las
++    profundidades YA están marginalizadas en S (Schur visual) y NO acoplan con v
++    → la marginalización no cambia. El factor IMU agrega curvatura en
++    pose-pose / pose-vel / vel-vel (Gauss-Newton: H=JᵀΩJ, g=-JᵀΩr) entre
++    keyframes consecutivos. El factor que cruza el borde fijo (fixedp-1, fixedp)
++    aporta solo al lado libre (el fijo se descarta, como en el factor de plano).
++
++    Devuelve dX (b, nprime, 1, 6, 1) (update de pose, alimenta la back-subst. de
++    depth idéntica al baseline) y vels_new (n_total, 3) con las velocidades libres
++    actualizadas. El solve es en CPU (D pequeño; esquiva el cuSOLVER Tegra JP6).
++
++    ROBUSTEZ (guard de divergencia, paso 1 Hito 3 — finding
++    2026-06-19-imu-tight-coupling-robustness). El estado aumentado (pose⊕vel)
++    puede mal-condicionarse para ciertos muestreos de parches y la BA infla la
++    escala PROGRESIVAMENTE (1/9 runs del primer experimento: v1 seed2 ×7.6, sin
++    crash). Mecanismo: la velocidad absorbe la libertad de escala del gauge mono
++    — `r_Δp = Riᵀ(Δpos − v·Δt − ½g·Δt²) − Δp_imu` con `Δp_imu` FIJO métrico →
++    inflar `Δpos` exige inflar `v`. Por eso la dirección degenerada se mata
++    ACOTANDO ‖v‖ a un máximo físico (`v_max`, proyección post-solve): si la pose
++    quiere inflar, la velocidad topa el cap y el residual `r_Δp` crece →
++    restablece la escala métrica. Además, si el solve es no-finito o el paso de
++    pose es absurdo (`max_step`), se RECHAZA el factor IMU y se cae a la BA visual
++    pura (`block_solve`) para ese paso. v_max=0 / max_step=0 ⇒ guard apagado
++    (comportamiento del primer experimento). El guard es no-op en runs físicos
++    (‖v‖ de marcha < cap) → no toca el anclaje de gym_v2/v3.
++    """
++    from .imu_preint import imu_factor_linearize, imu_information
++
++    dev, dt = S.device, S.dtype
++    Dp, Dv = nprime * 6, nprime * 3
++    D = Dp + Dv
++    H = torch.zeros(D, D, device=dev, dtype=dt)
++    g = torch.zeros(D, device=dev, dtype=dt)
++
++    # bloque visual (Schur de pose) -> esquina pose-pose
++    S2 = S.permute(0, 1, 3, 2, 4).reshape(Dp, Dp)
++    y1 = y.permute(0, 1, 3, 2, 4).reshape(Dp)
++    H[:Dp, :Dp] += S2
++    g[:Dp] += y1
++
++    vels = imu["vels"]                       # (n_total, 3) body-en-mundo
++    gw = imu["g"]
++    sig_g, sig_a, strength = imu["sig_g"], imu["sig_a"], imu["strength"]
++    v_max = float(imu.get("v_max", 0.0))     # cap físico de ‖v‖ (m/s; 0=off)
++    max_step = float(imu.get("max_step", 0.0))  # cap de traslación por paso (m; 0=off)
++    v_reg = float(imu.get("v_reg", 0.0))     # Tikhonov in-solver sobre ‖v‖ (0=off)
++    pdata = poses.data[0]                     # (N, 7) world->cam
++    for (i_g, j_g, pre) in imu["preints"]:
++        a_i, a_j = i_g - fixedp, j_g - fixedp
++        if a_j < 0 or a_j >= nprime:          # fijo, o fuera del sistema reducido
++            continue
++        vi, vj = vels[i_g], vels[j_g]
++        r, Jpi, Jvi, Jpj, Jvj = imu_factor_linearize(
++            pdata[i_g], pdata[j_g], vi, vj, gw, pre)
++        Om = imu_information(pre, sig_g, sig_a, strength, dev, dt)
++        subs = []
++        if a_i >= 0:
++            subs.append((Jpi, 6 * a_i))            # pose i (libre)
++            subs.append((Jvi, Dp + 3 * a_i))       # vel i
++        subs.append((Jpj, 6 * a_j))                # pose j (libre)
++        subs.append((Jvj, Dp + 3 * a_j))           # vel j
++        for (Ja, oa) in subs:
++            da = Ja.shape[1]
++            JaTOm = Ja.transpose(0, 1) @ Om        # (da, 9)
++            g[oa:oa + da] += -(JaTOm @ r)
++            for (Jb, ob) in subs:
++                db = Jb.shape[1]
++                H[oa:oa + da, ob:ob + db] += JaTOm @ Jb
++
++    # --- regularización in-solver de velocidad (Tikhonov, robustez paso 1) ---
++    # La dirección degenerada que infla la escala es `Δpos grande ⊕ v grande`
++    # (se cancelan en r_Δp contra el Δp_imu FIJO). El cap POST-solve no la
++    # previene (queda fuera del GN). Penalizar ‖v‖ DENTRO del sistema
++    # (½·v_reg·‖v‖²: H[v,v]+=v_reg·I, g[v]-=v_reg·v) sí remueve esa libertad y
++    # acota el drift de escala. v_reg=0 ⇒ comportamiento del primer experimento.
++    if v_reg > 0:
++        vfree = vels[fixedp:fixedp + nprime].reshape(-1).to(dt)   # (Dv,)
++        idx = torch.arange(Dp, D, device=dev)
++        H[idx, idx] += v_reg
++        g[Dp:] += -v_reg * vfree
++
++    # damping Levenberg (pose: igual que block_solve; vel: piso pequeño)
++    diag = torch.diagonal(H).clone()
++    damp = torch.empty(D, device=dev, dtype=dt)
++    damp[:Dp] = ep + lm * diag[:Dp]
++    damp[Dp:] = 1e-6 + lm * diag[Dp:]
++    H = H + torch.diag(damp)
++
++    def _cap_vels(vn):
++        """Proyección física: acota ‖v‖ de las velocidades LIBRES a v_max."""
++        if v_max <= 0:
++            return vn, 0
++        free = vn[fixedp:fixedp + nprime]
++        sp = free.norm(dim=-1)
++        over = sp > v_max
++        nclamp = int(over.sum())
++        if nclamp:
++            scale = torch.where(over, v_max / sp.clamp(min=1e-9),
++                                torch.ones_like(sp))
++            vn[fixedp:fixedp + nprime] = free * scale[:, None]
++        return vn, nclamp
++
++    # --- guarda de divergencia: solve robusto + rechazo a visual-only ---
++    reject = False
++    try:
++        delta = torch.linalg.solve(H.cpu(), g.cpu()).to(dev)
++    except RuntimeError:
++        delta, reject = None, True
++    if (delta is None) or (not torch.isfinite(delta).all()):
++        reject = True
++    if (not reject) and max_step > 0:
++        tstep = delta[:Dp].view(nprime, 6)[:, :3]          # traslación por keyframe
++        if float(tstep.norm(dim=-1).max()) > max_step:
++            reject = True
++
++    if reject:
++        # paso IMU descartado: BA visual pura + velocidades acotadas (no se
++        # propaga la inflación). Worst-case = baseline (que en v1 ya era bueno).
++        dX = block_solve(S, y, ep=ep, lm=lm)
++        vels_new, _ = _cap_vels(vels.clone())
++        imu["_reject"] = imu.get("_reject", 0) + 1
++        return dX, vels_new
++
++    dpose = delta[:Dp]
++    dvel = delta[Dp:].reshape(nprime, 3)
++    vels_new = vels.clone()
++    vels_new[fixedp:fixedp + nprime] = vels[fixedp:fixedp + nprime] + dvel
++    vels_new, nclamp = _cap_vels(vels_new)                 # cap físico: mata la dirección degenerada
++    imu["_nclamp"] = imu.get("_nclamp", 0) + nclamp
++    dX = dpose.view(1, nprime, 1, 6, 1)
++    return dX, vels_new
++
++
++def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False, prior_d=None, prior_w=None, prior_strength=0.0, quality_boost=1.0, plane=None, plane_strength=0.0, plane_trim=0.0, patch_anchor=None, imu=None):
 +    """ bundle adjustment
 +
 +    prior_d / prior_w / prior_strength (variante C in-solver): factor unario de
@@ -50,11 +234,26 @@ index ace7163..551d7a2 100644
 +    el complemento de Schur, fuerza poses metricas (rompe el modo plano del gauge
 +    mono). Backward-compatible: prior_w=None => BA original.
 +    Ver finding 2026-06-05-dpvo-variant-c-scale-nondeterministic.
++
++    plane / plane_strength / plane_trim / patch_anchor (factor de plano in-solver,
++    P2 Hito 3): restricción de coplanaridad BLANDA `π·X_world ≈ 0` por parche, que
++    entra JUNTO al factor unario de depth (no en vez de él). `plane` es el plano
++    (4,) `[n,d]` en coords del MUNDO (lo arma dpvo desde el plano cam-local +
++    pose de su frame de referencia). `plane_strength` la fuerza relativa al dato
++    (como prior_strength); `plane_trim` (m) descarta parches fuera del net por
++    distancia euclídea al plano; `patch_anchor` = mapa frame-ancla por índice
++    GLOBAL de parche (`self.ix`). El depth ancla la ESCALA, el plano ancla el
++    LATERAL (anti-abombamiento). plane=None ⇒ sin factor de plano.
++    Ver handoff docs/handoffs/2026-06-18-p2-stereo-frontend-evaluated-next-insolver-plane.md.
 +    """
  
      b = 1
      n = max(ii.max().item(), jj.max().item()) + 1
-@@ -108,9 +133,20 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
++    n_total = n                                   # nº de frames activos (antes del offset fixedp)
+ 
+     coords, v, (Ji, Jj, Jz) = \
+         pops.transform(poses, patches, intrinsics, ii, jj, kk, jacobian=True)
+@@ -108,9 +329,20 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
      if PRINT:
          print((r * v[...,None]).norm(dim=-1).mean().item())
  
@@ -76,25 +275,89 @@ index ace7163..551d7a2 100644
      wJiT = (weights * Ji).transpose(2,3)
      wJjT = (weights * Jj).transpose(2,3)
      wJzT = (weights * Jz).transpose(2,3)
-@@ -152,6 +188,18 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
+@@ -152,6 +384,54 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
  
      w = safe_scatter_add_vec(torch.matmul(wJzT,  r), kk, m)
  
++    Cdata = C.view(b, m)[0].clone()                       # (m,) Hessian de datos (limpio)
++
 +    # --- variante C in-solver: prior unario de profundidad (curvatura -> Schur) ---
 +    if (prior_w is not None) and (prior_d is not None) and (prior_strength > 0):
 +        pw = prior_w[kx]                                   # (m,) validez 0/1
 +        if torch.any(pw > 0):
-+            Cdiag = C.view(b, m)[0]                        # (m,) Hessian de datos
-+            cref = Cdiag[pw > 0].median() if (pw > 0).any() else C.new_tensor(1.0)
++            cref = Cdata[pw > 0].median() if (pw > 0).any() else C.new_tensor(1.0)
 +            wp = (prior_strength * cref * pw).view(b, m, 1, 1)
 +            d_cur = patches[:, kx, 2, p // 2, p // 2].view(b, m, 1, 1)
 +            d_zed = prior_d[kx].view(b, m, 1, 1)
 +            C = C + wp                                     # +curvatura en profundidad
 +            w = w + wp * (d_zed - d_cur)                   # +gradiente del prior
 +
++    # --- factor de plano in-solver: coplanaridad blanda π·X_world ≈ 0 (P2 Hito 3) ---
++    # Ancla la geometría LATERAL del net (anti-abombamiento) sin tocar la escala
++    # (la fija el factor unario de depth de arriba). Residual homogéneo por parche
++    # → curvatura en pose ancla + profundidad, acopladas vía el complemento de
++    # Schur (B, E, C, v, w). Las contribuciones de pose se descartan solas para
++    # parches anclados a poses FIJAS (safe_scatter guarda índice <0); su depth sí
++    # entra (C, w). Ver handoff 2026-06-18-p2-stereo-frontend-evaluated.
++    if (plane is not None) and (plane_strength > 0) and (patch_anchor is not None):
++        r_pl, W_pl, Jp_pl, Jd_pl = _plane_factor(
++            poses, patches, intrinsics, plane, kx, patch_anchor, p)
++        pw_pl = (prior_w[kx] if prior_w is not None
++                 else torch.ones_like(r_pl[0])).clone()    # (m,) validez en el net
++        if plane_trim > 0:
++            # trim por distancia EUCLÍDEA al plano (r = W·dist) — protege de parches
++            # fuera del net (foreground) sin forzarlos a la malla.
++            dist = (r_pl / W_pl.clamp(min=1e-6))[0]        # (m,)
++            pw_pl = pw_pl * (dist.abs() < plane_trim).float()
++        if torch.any(pw_pl > 0):
++            cref_pl = Cdata[pw_pl > 0].median()
++            wpl = (plane_strength * cref_pl * pw_pl).view(b, m, 1, 1)   # (b,m,1,1)
++            JpT = Jp_pl.transpose(-1, -2)                  # (1,m,6,1)
++            neg_r = (-r_pl).view(b, m, 1, 1)               # (b,m,1,1)
++            Bpl = torch.matmul(JpT, Jp_pl) * wpl           # (1,m,6,6)
++            Epl = torch.matmul(JpT, Jd_pl) * wpl           # (1,m,6,1)
++            Cpl = (Jd_pl ** 2).view(b, m, 1, 1) * wpl      # (b,m,1,1)
++            vpl = JpT * (wpl * neg_r)                      # (1,m,6,1)
++            wpl_d = (Jd_pl.view(b, m, 1, 1)) * (wpl * neg_r)               # (b,m,1,1)
++            a_idx = (patch_anchor[kx] - fixedp).to(ii.device)             # (m,) pose remap
++            kidx = torch.arange(m, device=ii.device)
++            B = B + safe_scatter_add_mat(Bpl, a_idx, a_idx, n, n).view(b, n, n, 6, 6)
++            E = E + safe_scatter_add_mat(Epl, a_idx, kidx, n, m).view(b, n, m, 6, 1)
++            v = v + safe_scatter_add_vec(vpl, a_idx, n).view(b, n, 1, 6, 1)
++            C = C + Cpl
++            w = w + wpl_d
++
      if isinstance(lmbda, torch.Tensor):
          lmbda = lmbda.reshape(*C.shape)
          
+@@ -160,13 +440,19 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
+     ### solve w/ schur complement ###
+     EQ = E * Q[:,None]
+ 
++    vels_out = None
+     if structure_only or n == 0:
+         dZ = (Q * w).view(b, -1, 1, 1)
+ 
+     else:
+         S = B - block_matmul(EQ, E.permute(0,2,1,4,3))
+         y = v - block_matmul(EQ, w.unsqueeze(dim=2))
+-        dX = block_solve(S, y, ep=ep, lm=1e-4)
++        if (imu is not None) and (len(imu.get("preints", [])) > 0):
++            # tight coupling: sistema reducido de pose AUMENTADO con velocidades
++            # + factor de preintegración IMU (estrategia B Hito 3).
++            dX, vels_out = _solve_augmented_imu(S, y, poses, imu, fixedp, n, ep)
++        else:
++            dX = block_solve(S, y, ep=ep, lm=1e-4)
+ 
+         dZ = Q * (w - block_matmul(E.permute(0,2,1,4,3), dX).squeeze(dim=-1))
+         dX = dX.view(b, -1, 6)
+@@ -179,4 +465,6 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds,
+     if not structure_only and n > 0:
+         poses = pose_retr(poses, dX, fixedp + torch.arange(n))
+ 
++    if imu is not None:
++        return poses, patches, vels_out
+     return poses, patches
 diff --git a/dpvo/config.py b/dpvo/config.py
 index be1c500..a0f8e2b 100644
 --- a/dpvo/config.py
@@ -124,10 +387,10 @@ index be1c500..a0f8e2b 100644
  _C.PATCHES_PER_FRAME = 80
  _C.REMOVAL_WINDOW = 20
 diff --git a/dpvo/dpvo.py b/dpvo/dpvo.py
-index 65646a3..8cd6254 100644
+index 65646a3..1f7d560 100644
 --- a/dpvo/dpvo.py
 +++ b/dpvo/dpvo.py
-@@ -48,6 +48,16 @@ class DPVO:
+@@ -48,6 +48,70 @@ class DPVO:
          self.index_ = torch.zeros(self.N, self.M, dtype=torch.long, device="cuda")
          self.index_map_ = torch.zeros(self.N, dtype=torch.long, device="cuda")
  
@@ -141,19 +404,78 @@ index 65646a3..8cd6254 100644
 +        self.depth_prior_alpha = 0.0      # blend post-BA (modo "prior", gauge-libre)
 +        self.depth_prior_strength = 0.0   # factor unario in-solver (modo "prior_insolver")
 +
++        # factor de plano in-solver (P2 Hito 3): plano cam-local `[n,d]` por frame
++        # (estimado fuera de la BA desde la nube estéreo validada — RANSAC en el
++        # runner) + validez. Alineado por slot con patches_ (se desplaza en
++        # keyframe()). En la BA se transforma a coords del MUNDO con la pose del
++        # frame de referencia y entra como restricción de coplanaridad BLANDA
++        # JUNTO al prior de depth (no en vez de él). Ver handoff 2026-06-18.
++        self.plane_n_ = torch.zeros(self.N, 3, device="cuda")    # normal cam-local (|n|=1)
++        self.plane_d_ = torch.zeros(self.N, device="cuda")       # offset cam-local
++        self.plane_w_ = torch.zeros(self.N, device="cuda")       # 1 si el frame tiene plano
++        self.plane_strength = 0.0         # fuerza del factor de plano (0 = off)
++        self.plane_trim = 0.0             # trim por distancia euclídea al plano (m)
++        self.plane_set_counter = 0        # ++ cada vez que el runner setea un plano
++        self._plane_world_cache = None    # π_world congelado entre refits
++        self._plane_world_cache_id = -1
++        # B1 (planos LOCALES por ventana): "frozen" = P2 (plano per-frame
++        # congelado, global); "window" = RANSAC fresco sobre los puntos 3-D de
++        # los parches de la ventana activa cada BA. Ver handoff B1 Hito 3.
++        self.plane_mode = "frozen"
++        self.plane_inlier_thresh = 0.08   # umbral RANSAC del plano de ventana (m)
++        # Gap 2 Hito 3 — plano VERTICAL por gravedad: si plane_vertical y plane_grav
++        # (3,) están seteados, el RANSAC del plano de ventana restringe las hipótesis
++        # a planos VERTICALES (normal ⊥ gravedad). La red de la jaula es vertical →
++        # quita 1 DOF a la normal ruidosa (que era la varianza que hundió a B1). Usa
++        # SOLO el acelerómetro (la gravedad mundo) → NO necesita gyro → corre en
++        # video_4 (gyro muerto). Ver finding 2026-06-20-underwater-svo-no-gyro.
++        self.plane_vertical = False
++        self.plane_grav = None            # (3,) gravedad en el mundo (frame 0 = identidad)
++
++        # tight coupling IMU (estrategia B Hito 3): velocidad body-en-mundo por
++        # keyframe (estado EXTRA de la BA aumentada) + timestamp real (ns) por slot
++        # para alinear con el stream IMU. Alineados con poses_; se desplazan en
++        # keyframe(). El stream IMU (frame cámara) y la gravedad mundo los setea el
++        # runner. El factor de preintegración vive en imu_preint.py + ba.py.
++        # Ver finding 2026-06-19-ekf-imu-loose-coupling + handoff tight coupling.
++        self.vels_ = torch.zeros(self.N, 3, device="cuda")
++        self.frame_ts_ = torch.zeros(self.N, dtype=torch.long, device="cuda")
++        self.imu_tight = False
++        self.imu_ts = None        # (Msamp,) long ns ORDENADO
++        self.imu_acc = None       # (Msamp,3) m/s² frame cámara
++        self.imu_gyr = None       # (Msamp,3) rad/s frame cámara
++        self.imu_g = None         # (3,) gravedad en el mundo (frame 0 = identidad)
++        self.imu_sig_g = 0.01     # ruido gyro (peso relativo del residual r_ΔR)
++        self.imu_sig_a = 0.2      # ruido acc  (peso de r_Δv / r_Δp)
++        self.imu_strength = 1.0   # fuerza global del factor IMU (como prior_strength)
++        # guard de divergencia (robustez, paso 1 Hito 3): cap físico de ‖v‖ que
++        # mata la dirección degenerada que infla la escala, + cap de paso de pose
++        # que cae a BA visual. 0=off. Ver finding tight-coupling-robustness.
++        self.imu_v_max = 0.0      # m/s; máx ‖v‖ de keyframe (proyección post-solve; REFUTADO)
++        self.imu_max_step = 0.0   # m; máx traslación de pose por paso (si no, fallback)
++        self.imu_v_reg = 0.0      # Tikhonov in-solver sobre ‖v‖ (anti-drift de escala)
++        self.imu_n_clamp = 0      # contador: velocidades acotadas
++        self.imu_n_reject = 0     # contador: pasos IMU rechazados (fallback visual)
++        self._preint_cache = {}   # (ts_i,ts_j) -> Preint (medidas fijas: se cachea)
++
          ### network attributes ###
          self.mem = 32
  
-@@ -232,6 +242,8 @@ class DPVO:
+@@ -232,6 +296,13 @@ class DPVO:
                  self.colors_[i] = self.colors_[i+1]
                  self.poses_[i] = self.poses_[i+1]
                  self.patches_[i] = self.patches_[i+1]
 +                self.disps_prior_[i] = self.disps_prior_[i+1]
 +                self.disps_prior_w_[i] = self.disps_prior_w_[i+1]
++                self.plane_n_[i] = self.plane_n_[i+1]
++                self.plane_d_[i] = self.plane_d_[i+1]
++                self.plane_w_[i] = self.plane_w_[i+1]
++                self.vels_[i] = self.vels_[i+1]
++                self.frame_ts_[i] = self.frame_ts_[i+1]
                  self.intrinsics_[i] = self.intrinsics_[i+1]
  
                  self.imap_[i%self.mem] = self.imap_[(i+1) % self.mem]
-@@ -263,12 +275,21 @@ class DPVO:
+@@ -263,12 +334,21 @@ class DPVO:
              t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
              t0 = max(t0, 1)
  
@@ -181,7 +503,7 @@ index 65646a3..8cd6254 100644
              points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
              points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
              self.points_[:len(points)] = points[:]
-@@ -293,7 +314,88 @@ class DPVO:
+@@ -293,7 +373,279 @@ class DPVO:
          return flatmeshgrid(torch.arange(t0, t1, device="cuda"),
              torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
  
@@ -242,6 +564,46 @@ index 65646a3..8cd6254 100644
 +        blended = (1.0 - aw) * cur + aw * d_prior
 +        self.patches_[lo:hi, :, 2] = blended.clamp(min=1e-3, max=10.0)
 +
++    def _body_pos(self, i):
++        """Posición de la cámara (body) en el mundo del slot i: p_wb = -R(G)ᵀ t(G),
++        con G = poses_[i] (world→cam)."""
++        M = SE3(self.poses_[i][None]).matrix()[0]
++        R = M[:3, :3]
++        t = M[:3, 3]
++        return -(R.transpose(-1, -2) @ t)
++
++    def _build_imu_factors(self, t0):
++        """Arma el dict de factores IMU para la BA aumentada (tight coupling):
++        preintegración entre cada par de keyframes consecutivos de la ventana
++        [t0-1, n) (incluye el borde fijo→libre). Devuelve None si no hay pares o
++        falta el stream IMU. Las medidas son fijas → la preintegración se cachea."""
++        from .imu_preint import segment_preint
++        if self.imu_ts is None or self.imu_g is None:
++            return None
++        n = self.n
++        lo = max(int(t0) - 1, 0)
++        if n - lo < 2:
++            return None
++        preints = []
++        cache = self._preint_cache
++        for i in range(lo, n - 1):
++            ti = int(self.frame_ts_[i]); tj = int(self.frame_ts_[i + 1])
++            if tj <= ti:
++                continue
++            key = (ti, tj)
++            pre = cache.get(key)
++            if pre is None:
++                pre = segment_preint(self.imu_ts, self.imu_acc, self.imu_gyr, ti, tj)
++                cache[key] = pre
++            preints.append((i, i + 1, pre))
++        if not preints:
++            return None
++        return {"preints": preints, "vels": self.vels_[:n], "g": self.imu_g,
++                "sig_g": self.imu_sig_g, "sig_a": self.imu_sig_a,
++                "strength": self.imu_strength,
++                "v_max": self.imu_v_max, "max_step": self.imu_max_step,
++                "v_reg": self.imu_v_reg}
++
 +    def _ba_python_prior(self, target, weight, t0):
 +        """Variante C in-solver: corre la BA de Python (`ba.py`) con un factor
 +        unario de profundidad DENTRO del solver (en vez de `fastba` + blend
@@ -258,20 +620,171 @@ index 65646a3..8cd6254 100644
 +        prior_w = self.disps_prior_w_.view(-1)
 +        strength = float(getattr(self, "depth_prior_strength", 0.0))
 +        qboost = float(getattr(self, "depth_quality_boost", 1.0))
++        # factor de plano in-solver (P2): transforma el plano cam-local del frame
++        # de referencia a coords del MUNDO con su pose actual y lo mantiene FIJO
++        # durante el solve (alternancia a cadencia de frame). Ver handoff 2026-06-18.
++        plane_strength = float(getattr(self, "plane_strength", 0.0))
++        if plane_strength > 0:
++            if getattr(self, "plane_mode", "frozen") == "window":
++                plane = self._fit_window_plane(Gs, t0)   # B1: plano local fresco
++            else:
++                plane = self._world_plane(Gs)            # P2: plano per-frame congelado
++        else:
++            plane = None
++        plane_trim = float(getattr(self, "plane_trim", 0.0))
++        patch_anchor = self.ix if plane is not None else None
++        use_imu = bool(getattr(self, "imu_tight", False)) and self.is_initialized
 +        for _ in range(2):
-+            Gs, patches = _pyBA(
++            imu = self._build_imu_factors(t0) if use_imu else None
++            out = _pyBA(
 +                Gs, patches, self.intrinsics, target, weight, 1e-4,
 +                self.ii, self.jj, self.kk, bounds, ep=10.0, fixedp=t0,
 +                structure_only=False, prior_d=prior_d, prior_w=prior_w,
-+                prior_strength=strength, quality_boost=qboost)
++                prior_strength=strength, quality_boost=qboost,
++                plane=plane, plane_strength=(plane_strength if plane is not None else 0.0),
++                plane_trim=plane_trim, patch_anchor=patch_anchor, imu=imu)
++            if imu is not None:
++                Gs, patches, vels_new = out
++                if vels_new is not None:
++                    self.vels_[:vels_new.shape[0]] = vels_new
++                self.imu_n_clamp += int(imu.get("_nclamp", 0))
++                self.imu_n_reject += int(imu.get("_reject", 0))
++            else:
++                Gs, patches = out
 +        self.poses_[:] = Gs.data[0]
 +        self.patches_[:] = patches.view(self.N, self.M, 3, self.P, self.P)
 +
-+    def __call__(self, tstamp, image, intrinsics, depth=None):
++    def _world_plane(self, Gs):
++        """Plano (4,) `[n,d]` en coords del MUNDO desde el plano cam-local del frame
++        de referencia (el más reciente con plano válido). El plano cam π_c cumple
++        π_c·X_cam=0 con X_cam=G·X_world (G mundo→cam) → π_world=Gᵀ·π_c. Devuelve None
++        si no hay plano válido.
++
++        **Plano FIJO + alternancia** (spec del handoff 2026-06-18): π_world se
++        CONGELA al setear un plano nuevo (contador `plane_set_counter` en __call__)
++        y se reusa entre refits, en vez de re-derivarlo cada update() desde la pose
++        (que evoluciona) del frame de referencia. Eso evita el "chase" de un plano
++        que salta frame a frame (que desestabilizaba y acotaba el strength útil).
++        La cadencia de refit la fija --plane-refit-every del runner.
++        """
++        cnt = int(getattr(self, "plane_set_counter", 0))
++        if (getattr(self, "_plane_world_cache_id", -1) == cnt
++                and getattr(self, "_plane_world_cache", None) is not None):
++            return self._plane_world_cache                 # congelado entre refits
++        valid = (self.plane_w_[:self.n] > 0).nonzero(as_tuple=False)
++        if valid.numel() == 0:
++            return None
++        f = int(valid[-1].item())                          # frame de referencia más reciente
++        pi_cam = torch.cat([self.plane_n_[f], self.plane_d_[f].view(1)])   # (4,)
++        M = Gs[:, f].matrix()[0]                            # (4,4) mundo→cam del frame f
++        pi_world = M.transpose(-1, -2) @ pi_cam            # (4,) plano en el mundo
++        self._plane_world_cache = pi_world
++        self._plane_world_cache_id = cnt
++        return pi_world
++
++    def _fit_window_plane(self, Gs, t0):
++        """B1 (planos LOCALES): ajusta un plano FRESCO por RANSAC a los puntos 3-D
++        de los parches de la VENTANA activa [t0, n) en coords del MUNDO, cada BA.
++        A diferencia de `_world_plane` (P2: un plano per-frame congelado/global), se
++        re-estima desde los puntos YA optimizados de la ventana → nunca obsoleto,
++        robusto al ruido per-frame, y respeta la geometría orbital (cada ventana de
++        la órbita ≈ un plano local). NO usa los buffers `plane_*` ni depth del SDK:
++        el plano sale de los propios parches anclados (selectos+texturados+con prior
++        de depth válido). Devuelve π=[n,d] (4,), |n|=1, o None. Ver handoff B1 Hito 3.
++        """
++        m = self.m
++        if m < 30:
++            return None
++        P = self.P
++        pc = pops.point_cloud(Gs, self.patches[:, :m], self.intrinsics, self.ix[:m])
++        pts4 = pc[0, :, P // 2, P // 2, :]                 # (m, 4) homogéneo [X,Y,Z,W=1/Z]
++        w = pts4[:, 3]
++        xyz = pts4[:, :3] / w.clamp(min=1e-6)[:, None]     # (m, 3) euclídeo en el mundo
++        anchor = self.ix[:m]
++        pw = self.disps_prior_w_.view(-1)[:m]
++        sel = ((anchor >= t0) & (anchor < self.n) & (pw > 0) & (w > 1e-6)
++               & torch.isfinite(xyz).all(-1))
++        Q = xyz[sel]
++        if Q.shape[0] < 30:
++            return None
++        grav = (self.plane_grav if bool(getattr(self, "plane_vertical", False))
++                and getattr(self, "plane_grav", None) is not None else None)
++        return self._ransac_plane(
++            Q, iters=64, thresh=float(getattr(self, "plane_inlier_thresh", 0.08)),
++            grav=grav)
++
++    @staticmethod
++    def _ransac_plane(pts, iters=64, thresh=0.08, grav=None):
++        """RANSAC de plano sobre (K,3) torch → π=[n,d] (4,), |n|=1, n·X+d=0; refit
++        SVD sobre inliers. None si no converge (<20 inliers).
++
++        Si `grav` (3,) no es None, restringe las hipótesis a planos VERTICALES
++        (normal ⊥ gravedad): la red de la jaula cuelga vertical → quita 1 DOF a la
++        normal y elimina la libertad del RANSAC de inclinarse a ajustar el "queso
++        suizo"/alias (que era la varianza que hundió a B1). Gap 2 Hito 3 — usa solo
++        el acelerómetro (no necesita gyro). El hipótesis vertical desde 2 puntos a,b:
++        n = (b−a) × ĝ (⊥ gravedad y contiene a,b); el refit fuerza la normal al
++        subespacio horizontal ⊥ ĝ (PCA 2-D de menor varianza)."""
++        K = pts.shape[0]
++        ghat = None
++        if grav is not None:
++            gn = grav.norm()
++            if gn < 1e-9:
++                grav = None
++            else:
++                ghat = (grav / gn).to(pts)
++        best_inl, best_c = None, -1
++        for _ in range(iters):
++            if ghat is not None:
++                idx = torch.randint(0, K, (2,), device=pts.device)
++                a, b = pts[idx[0]], pts[idx[1]]
++                nrm = torch.cross(b - a, ghat, dim=-1)    # ⊥ gravedad y contiene a,b
++                anchor = a
++            else:
++                idx = torch.randint(0, K, (3,), device=pts.device)
++                a, b, c = pts[idx[0]], pts[idx[1]], pts[idx[2]]
++                nrm = torch.cross(b - a, c - a, dim=-1)
++                anchor = a
++            nn = nrm.norm()
++            if nn < 1e-9:
++                continue
++            nrm = nrm / nn
++            d = -(nrm * anchor).sum()
++            inl = ((pts * nrm).sum(-1) + d).abs() < thresh
++            cnt = int(inl.sum())
++            if cnt > best_c:
++                best_c, best_inl = cnt, inl
++        if best_inl is None or best_c < 20:
++            return None
++        Qc = pts[best_inl]
++        cen = Qc.mean(0)
++        if ghat is not None:
++            # refit VERTICAL: normal en el subespacio horizontal ⊥ gravedad (PCA 2-D)
++            ref = torch.tensor([1.0, 0.0, 0.0], device=pts.device, dtype=pts.dtype)
++            e1 = torch.cross(ghat, ref, dim=-1)
++            if e1.norm() < 1e-6:
++                ref = torch.tensor([0.0, 1.0, 0.0], device=pts.device, dtype=pts.dtype)
++                e1 = torch.cross(ghat, ref, dim=-1)
++            e1 = e1 / e1.norm()
++            e2 = torch.cross(ghat, e1, dim=-1); e2 = e2 / e2.norm()
++            B = torch.stack([e1, e2], 0)                   # (2,3) base horizontal
++            XY = (Qc - cen) @ B.T                           # (K,2) proyección horizontal
++            _, _, Vh = torch.linalg.svd(XY, full_matrices=False)
++            n2 = Vh[-1]                                     # (2,) dir. de menor varianza
++            nrm = n2[0] * e1 + n2[1] * e2
++            nrm = nrm / nrm.norm()
++        else:
++            _, _, Vh = torch.linalg.svd(Qc - cen, full_matrices=False)
++            nrm = Vh[-1]
++            nrm = nrm / nrm.norm()
++        d = -(nrm * cen).sum()
++        return torch.cat([nrm, d.view(1)]).to(pts)
++
++    def __call__(self, tstamp, image, intrinsics, depth=None, plane=None, frame_ts=None):
          """ track new frame """
  
          if (self.n+1) >= self.N:
-@@ -304,8 +406,11 @@ class DPVO:
+@@ -304,13 +656,18 @@ class DPVO:
          with autocast(enabled=self.cfg.MIXED_PRECISION, device_type="cuda"):
              fmap, gmap, imap, patches, _, clr = \
                  self.network.patchify(image,
@@ -285,7 +798,14 @@ index 65646a3..8cd6254 100644
                      return_color=True)
  
          ### update state attributes ###
-@@ -332,11 +437,30 @@ class DPVO:
+         self.tlist.append(tstamp)
+         self.tstamps_[self.n] = self.counter
++        if frame_ts is not None:
++            self.frame_ts_[self.n] = int(frame_ts)   # tiempo real (ns) p/ IMU
+         self.intrinsics_[self.n] = intrinsics / self.RES
+ 
+         # color info for visualization
+@@ -332,11 +689,49 @@ class DPVO:
                  tvec_qvec = self.poses[self.n-1]
                  self.poses_[self.n] = tvec_qvec
  
@@ -294,6 +814,16 @@ index 65646a3..8cd6254 100644
 -        if self.is_initialized:
 -            s = torch.median(self.patches_[self.n-3:self.n,:,2])
 -            patches[:,:,2] = s
++        # --- init de velocidad body-en-mundo (tight coupling): diferencia finita
++        # de la posición VO del frame anterior. Es solo semilla; la BA aumentada
++        # la refina como variable libre. ---
++        if self.imu_tight and self.n >= 1 and frame_ts is not None:
++            dt = (int(self.frame_ts_[self.n]) - int(self.frame_ts_[self.n-1])) / 1e9
++            if dt > 1e-4:
++                self.vels_[self.n] = (self._body_pos(self.n) - self._body_pos(self.n-1)) / dt
++            else:
++                self.vels_[self.n] = self.vels_[self.n-1]
++
 +        # --- siembra de profundidad inversa de los parches (init de escala) ---
 +        # Default DPVO: profundidad inversa aleatoria -> escala-ambiguo (mono).
 +        # Inyección métrica opcional: si se entrega `depth` (metros, misma
@@ -313,6 +843,15 @@ index 65646a3..8cd6254 100644
 +                # unario DENTRO de la BA de Python (rompe el gauge).
 +                self.disps_prior_[self.n] = d_seed.view(self.M)
 +                self.disps_prior_w_[self.n] = valid_seed.float()
++            # factor de plano in-solver (P2): el runner entrega el plano cam-local
++            # `[n0,n1,n2,d]` (RANSAC sobre la nube estéreo validada). Se guarda por
++            # frame; la BA lo lleva a coords del mundo con la pose del frame.
++            if (inject_mode == "prior_insolver") and (plane is not None):
++                pl = torch.as_tensor(plane, dtype=torch.float, device="cuda").view(4)
++                self.plane_n_[self.n] = pl[:3]
++                self.plane_d_[self.n] = pl[3]
++                self.plane_w_[self.n] = 1.0
++                self.plane_set_counter += 1     # invalida el caché de π_world (refit)
 +        else:
 +            patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
 +            if self.is_initialized:
@@ -338,6 +877,343 @@ index 134d3ff..d362ee8 100644
        torch::Tensor dZ = Qt * (u - torch::matmul(Et, dX));
  
        dX = dX.view({N, 6});
+diff --git a/dpvo/imu_preint.py b/dpvo/imu_preint.py
+new file mode 100644
+index 0000000..f2ef17d
+--- /dev/null
++++ b/dpvo/imu_preint.py
+@@ -0,0 +1,331 @@
++"""imu_preint.py — Preintegración IMU (Forster et al. 2017) + factor inercial
++para tight coupling DPVO-métrico (estrategia B del Hito 3,
++`docs/06-imu-integration-roadmap.md` §B).
++
++A diferencia del EKF loose-coupling (`scripts/ekf_fuse_imu.py`, estrategia A),
++aquí la IMU **entra a la optimización** (la BA de Python de `ba.py`): la
++doble integración del acelerómetro restringe la ESCALA y la GRAVEDAD junto a la
++VO. El residual de preintegración conecta dos keyframes consecutivos de la
++ventana (pose_i, v_i) ↔ (pose_j, v_j).
++
++CONVENCIONES
++- Body = cámara izquierda (la IMU se rota al frame cámara con R_cam<-imu de
++  fábrica ANTES de llamar aquí; aquí acc/gyro ya están en el frame cámara, acc
++  en m/s², gyro en **rad/s** — la conversión deg/s→rad/s la hace
++  `extract_imu_svo.py`, gotcha pyzed 2026-06-19).
++- DPVO guarda poses **world→cam** (G = T_cam<-world). El body-en-mundo es
++  R_wb = R(G)ᵀ, p_wb = -R(G)ᵀ t(G). Esta capa trabaja con (R_wb, p_wb, v) en
++  el mundo (frame DPVO 0). El puente world→cam ↔ body-en-mundo lo hace
++  `pose_to_body()`.
++- v1 SIMPLE (handoff 2026-06-19): bias≈0 FIJO (los biases del static window del
++  gym están contaminados por movimiento → no fiables), gravedad FIJA estimada
++  al inicio. Solo se optimizan poses (ya en DPVO) + velocidades (3/keyframe).
++
++Referencia: C. Forster, L. Carlone, F. Dellaert, D. Scaramuzza, "On-Manifold
++Preintegration for Real-Time Visual-Inertial Odometry," IEEE T-RO 33(1), 2017.
++"""
++from __future__ import annotations
++
++import torch
++
++
++# ------------------------------- SO(3) -----------------------------------
++def so3_hat(w: torch.Tensor) -> torch.Tensor:
++    """(...,3) -> (...,3,3) matriz antisimétrica [w]×."""
++    o = torch.zeros_like(w[..., 0])
++    return torch.stack([
++        o, -w[..., 2], w[..., 1],
++        w[..., 2], o, -w[..., 0],
++        -w[..., 1], w[..., 0], o,
++    ], dim=-1).reshape(*w.shape[:-1], 3, 3)
++
++
++def so3_exp(w: torch.Tensor) -> torch.Tensor:
++    """Exp de SO(3) (Rodrigues). (...,3) -> (...,3,3)."""
++    theta = w.norm(dim=-1, keepdim=True)                       # (...,1)
++    small = theta < 1e-8
++    th = theta.clamp(min=1e-8)
++    k = w / th
++    K = so3_hat(k)
++    s = torch.sin(th)[..., None]
++    c = torch.cos(th)[..., None]
++    eye = torch.eye(3, device=w.device, dtype=w.dtype).expand(*w.shape[:-1], 3, 3)
++    R = eye + s * K + (1 - c) * (K @ K)
++    # límite θ→0: R ≈ I + [w]×
++    Rsmall = eye + so3_hat(w)
++    return torch.where(small[..., None], Rsmall, R)
++
++
++def so3_log(R: torch.Tensor) -> torch.Tensor:
++    """Log de SO(3). (...,3,3) -> (...,3)."""
++    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
++    cos_t = ((tr - 1) * 0.5).clamp(-1.0, 1.0)
++    theta = torch.acos(cos_t)                                  # (...)
++    w = torch.stack([
++        R[..., 2, 1] - R[..., 1, 2],
++        R[..., 0, 2] - R[..., 2, 0],
++        R[..., 1, 0] - R[..., 0, 1],
++    ], dim=-1)                                                 # (...,3) = 2 sinθ · axis
++    small = theta < 1e-5
++    sin_t = torch.sin(theta).clamp(min=1e-8)
++    coef = torch.where(small, torch.full_like(theta, 0.5),
++                       theta / (2 * sin_t))
++    return coef[..., None] * w
++
++
++# --------------------------- Preintegración ------------------------------
++class Preint:
++    """Medición preintegrada entre dos keyframes (bias fijo)."""
++    __slots__ = ("dR", "dv", "dp", "DT")
++
++    def __init__(self, dR, dv, dp, DT):
++        self.dR = dR        # (3,3) ΔR_ij
++        self.dv = dv        # (3,)  Δv_ij
++        self.dp = dp        # (3,)  Δp_ij
++        self.DT = DT        # float Δt_ij
++
++
++def preintegrate(acc: torch.Tensor, gyro: torch.Tensor, dts: torch.Tensor,
++                 ba: torch.Tensor | None = None,
++                 bg: torch.Tensor | None = None) -> Preint:
++    """Preintegra un segmento IMU (Forster discreto, ZOH al inicio del intervalo).
++
++    acc, gyro : (K,3) muestras en el frame cámara (acc m/s², gyro rad/s).
++    dts       : (K,) dt de cada paso (dt_k = t_{k+1}-t_k). El último dt puede ser
++                el resto hasta t_j. Se integran K pasos.
++    ba, bg    : (3,) bias acc/gyro (default 0).
++
++    Devuelve Preint(dR, dv, dp, DT). Δp usa dv ANTES de actualizarla (orden
++    Forster). Determinista; sin gravedad (es relativa).
++    """
++    dev, dt_type = acc.device, acc.dtype
++    if ba is None:
++        ba = torch.zeros(3, device=dev, dtype=dt_type)
++    if bg is None:
++        bg = torch.zeros(3, device=dev, dtype=dt_type)
++    dR = torch.eye(3, device=dev, dtype=dt_type)
++    dv = torch.zeros(3, device=dev, dtype=dt_type)
++    dp = torch.zeros(3, device=dev, dtype=dt_type)
++    DT = 0.0
++    K = acc.shape[0]
++    for k in range(K):
++        dt = float(dts[k])
++        if dt <= 0:
++            continue
++        a = acc[k] - ba
++        w = gyro[k] - bg
++        Ra = dR @ a
++        dp = dp + dv * dt + 0.5 * Ra * dt * dt
++        dv = dv + Ra * dt
++        dR = dR @ so3_exp(w * dt)
++        DT += dt
++    return Preint(dR, dv, dp, DT)
++
++
++# ------------------------------ Factor IMU -------------------------------
++def pose_to_body(G_data: torch.Tensor):
++    """world→cam (lietorch SE3 data, (...,7) [tx,ty,tz,qx,qy,qz,qw]) → body-en-mundo.
++
++    Devuelve (R_wb (...,3,3), p_wb (...,3)). R_wb = R(G)ᵀ, p_wb = -R(G)ᵀ t.
++    """
++    from lietorch import SE3
++    M = SE3(G_data).matrix()                          # (...,4,4) world→cam
++    R_cw = M[..., :3, :3]
++    t_cw = M[..., :3, 3]
++    R_wb = R_cw.transpose(-1, -2)
++    p_wb = -(R_wb @ t_cw[..., None]).squeeze(-1)
++    return R_wb, p_wb
++
++
++def imu_residual(Ri, pi, vi, Rj, pj, vj, g, pre: Preint) -> torch.Tensor:
++    """Residual de preintegración (9,) [r_ΔR(3); r_Δv(3); r_Δp(3)] (Forster eq 37,
++    bias fijo). Todos los estados en el mundo (body-en-mundo).
++
++    r_ΔR = Log(ΔRᵀ Riᵀ Rj)
++    r_Δv = Riᵀ(vj - vi - g·Δt) - Δv
++    r_Δp = Riᵀ(pj - pi - vi·Δt - 0.5 g·Δt²) - Δp
++    """
++    DT = pre.DT
++    RiT = Ri.transpose(-1, -2)
++    r_R = so3_log(pre.dR.transpose(-1, -2) @ RiT @ Rj)
++    r_v = (RiT @ (vj - vi - g * DT)[..., None]).squeeze(-1) - pre.dv
++    r_p = (RiT @ (pj - pi - vi * DT - 0.5 * g * DT * DT)[..., None]).squeeze(-1) - pre.dp
++    return torch.cat([r_R, r_v, r_p], dim=-1)
++
++
++def vel_jacobians(Ri, DT):
++    """Jacobianos analíticos del residual (9,) respecto a v_i y v_j (3 c/u).
++
++    ∂r/∂v_i = [[0],[-Riᵀ],[-Riᵀ·Δt]]   ∂r/∂v_j = [[0],[Riᵀ],[0]]
++    Devuelve (Jvi (9,3), Jvj (9,3)).
++    """
++    RiT = Ri.transpose(-1, -2)
++    Z = torch.zeros_like(RiT)
++    Jvi = torch.cat([Z, -RiT, -RiT * DT], dim=-2)             # (9,3)
++    Jvj = torch.cat([Z, RiT, Z], dim=-2)                      # (9,3)
++    return Jvi, Jvj
++
++
++def so3_jr_inv(phi: torch.Tensor) -> torch.Tensor:
++    """Inversa de la jacobiana DERECHA de SO(3) en `phi`. (...,3) -> (...,3,3).
++
++    J_r⁻¹(φ) = I + ½[φ]× + c₂·[φ]×²   con
++        c₂ = 1/θ² - cos(θ/2)/(2θ·sin(θ/2))     (θ=‖φ‖, → 1/12 cuando θ→0).
++    La forma con cot(θ/2) evita la singularidad de (1+cosθ)/sinθ en θ=π (sin(θ/2)
++    solo se anula en θ=0, cubierto por la rama small). La inversa IZQUIERDA es la
++    transpuesta: J_l⁻¹(φ) = J_r⁻¹(φ)ᵀ (porque [φ]×ᵀ=-[φ]× y ([φ]×²)ᵀ=[φ]×²).
++    """
++    theta = phi.norm(dim=-1, keepdim=True)                    # (...,1)
++    small = theta < 1e-4
++    th = theta.clamp(min=1e-8)
++    half = 0.5 * th
++    c2 = 1.0 / (th * th) - torch.cos(half) / (2.0 * th * torch.sin(half))
++    c2 = torch.where(small, torch.full_like(c2, 1.0 / 12.0), c2)   # (...,1)
++    K = so3_hat(phi)                                          # (...,3,3)
++    K2 = K @ K
++    eye = torch.eye(3, device=phi.device, dtype=phi.dtype).expand_as(K)
++    return eye + 0.5 * K + c2[..., None] * K2                 # (...,3,3)
++
++
++def pose_jacobians(Ri, Rj, RiT_av, RiT_ap, r_R, dR):
++    """Jacobianos ANALÍTICOS de pose del residual IMU (9,) respecto a las
++    perturbaciones lietorch `retr` de pose_i y pose_j.
++
++    CONVENCIÓN (la trampa del handoff 2026-06-20): DPVO actualiza poses con
++    `poses.retr(dx)` = `Exp(dx)·G` (perturbación IZQUIERDA de la pose world→cam,
++    `dx=[ρ(tras), ω(rot)]` en ese orden — el tangente SE3 de lietorch). Propagada
++    por `pose_to_body`, a primer orden induce sobre el estado body-en-mundo:
++        δR_wb = -R_wb[ω]×      (retracción DERECHA de R_wb por -ω)
++        δp_wb = -R_wb·ρ
++    De la regla de la cadena sobre `imu_residual` salen estos bloques no nulos:
++
++      ∂r_R/∂ω_i =  J_l⁻¹(r_R)·ΔRᵀ
++      ∂r_v/∂ω_i = -[Riᵀ·a_v]×
++      ∂r_p/∂ρ_i =  I            ∂r_p/∂ω_i = -[Riᵀ·a_p]×
++      ∂r_R/∂ω_j = -J_r⁻¹(r_R)
++      ∂r_p/∂ρ_j = -Riᵀ·Rj
++    con a_v = v_j-v_i-g·Δt, a_p = p_j-p_i-v_i·Δt-½g·Δt², y la identidad útil
++    Riᵀ·a_v = r_v+Δv, Riᵀ·a_p = r_p+Δp (= `RiT_av`, `RiT_ap`, reusa el residual).
++
++    Ri,Rj (3,3); RiT_av,RiT_ap (3,); r_R (3,); dR (3,3)=`pre.dR`.
++    Devuelve Jpi (9,6), Jpj (9,6) [cols 0-2 = ρ (tras), 3-5 = ω (rot)].
++    """
++    dev, dt = Ri.device, Ri.dtype
++    RiT = Ri.transpose(-1, -2)
++    Jr_inv = so3_jr_inv(r_R)                                  # (3,3)
++    Jl_inv = Jr_inv.transpose(-1, -2)                         # J_l⁻¹ = (J_r⁻¹)ᵀ
++
++    Jpi = torch.zeros(9, 6, device=dev, dtype=dt)
++    Jpj = torch.zeros(9, 6, device=dev, dtype=dt)
++    I3 = torch.eye(3, device=dev, dtype=dt)
++
++    # ---- pose i ----
++    Jpi[0:3, 3:6] = Jl_inv @ dR.to(dt).transpose(-1, -2)      # ∂r_R/∂ω_i
++    Jpi[3:6, 3:6] = -so3_hat(RiT_av)                          # ∂r_v/∂ω_i
++    Jpi[6:9, 0:3] = I3                                        # ∂r_p/∂ρ_i
++    Jpi[6:9, 3:6] = -so3_hat(RiT_ap)                          # ∂r_p/∂ω_i
++
++    # ---- pose j ----
++    Jpj[0:3, 3:6] = -Jr_inv                                   # ∂r_R/∂ω_j
++    Jpj[6:9, 0:3] = -(RiT @ Rj)                               # ∂r_p/∂ρ_j
++    return Jpi, Jpj
++
++
++def imu_information(pre: Preint, sig_g: float, sig_a: float,
++                   strength: float, device, dtype) -> torch.Tensor:
++    """Matriz de información Ω (9,9) diagonal del residual de preintegración.
++
++    Aproximación de escalado temporal (v1, en vez de la covarianza recursiva
++    completa de Forster): el error de Log(ΔR) crece ~√Δt (var ~Δt), el de Δv
++    ~√Δt, y el de Δp (doble integración) ~Δt^1.5 (var ~Δt³). Con un piso para no
++    explotar en Δt→0:
++        σ_R² = sig_g²·DT      σ_v² = sig_a²·DT     σ_p² = sig_a²·DT³/3
++    Ω = strength · diag(1/σ²). `strength` escala el peso global del factor IMU
++    relativo al término visual (como prior_strength/plane_strength).
++    """
++    DT = max(pre.DT, 1e-3)
++    s_R2 = sig_g * sig_g * DT
++    s_v2 = sig_a * sig_a * DT
++    s_p2 = sig_a * sig_a * DT * DT * DT / 3.0
++    inv = torch.tensor(
++        [1.0 / s_R2] * 3 + [1.0 / s_v2] * 3 + [1.0 / s_p2] * 3,
++        device=device, dtype=dtype)
++    return strength * torch.diag(inv)
++
++
++def segment_preint(imu_ts: torch.Tensor, imu_acc: torch.Tensor,
++                   imu_gyr: torch.Tensor, ts_i: int, ts_j: int,
++                   ba=None, bg=None) -> Preint:
++    """Preintegra el segmento IMU entre dos timestamps de keyframe (ns).
++
++    imu_ts (M,) long ORDENADO, imu_acc/imu_gyr (M,3) en frame cámara. Toma las
++    muestras en [ts_i, ts_j) (ZOH al inicio del intervalo) y el último dt cierra
++    hasta ts_j. Sin muestras (gap minúsculo) → Preint identidad con DT correcto.
++    """
++    dev, dt_type = imu_acc.device, imu_acc.dtype
++    ti = torch.tensor(int(ts_i), device=dev, dtype=imu_ts.dtype)
++    tj = torch.tensor(int(ts_j), device=dev, dtype=imu_ts.dtype)
++    lo = int(torch.searchsorted(imu_ts, ti, right=False))
++    hi = int(torch.searchsorted(imu_ts, tj, right=False))
++    DT = (int(ts_j) - int(ts_i)) / 1e9
++    if hi - lo < 1:
++        eye = torch.eye(3, device=dev, dtype=dt_type)
++        z = torch.zeros(3, device=dev, dtype=dt_type)
++        return Preint(eye, z, z, DT)
++    times = imu_ts[lo:hi].to(torch.float64)
++    acc = imu_acc[lo:hi]
++    gyr = imu_gyr[lo:hi]
++    L = times.shape[0]
++    dts = torch.empty(L, device=dev, dtype=dt_type)
++    if L > 1:
++        dts[:L - 1] = ((times[1:] - times[:-1]) / 1e9).to(dt_type)
++    dts[L - 1] = float((int(ts_j) - float(times[-1])) / 1e9)
++    return preintegrate(acc, gyr, dts, ba, bg)
++
++
++def imu_factor_linearize(Gi_data, Gj_data, vi, vj, g, pre: Preint,
++                         pose_jac: str = "analytic", eps: float = 5e-4):
++    """Linealiza el residual IMU (9,) respecto a (pose_i, v_i, pose_j, v_j).
++
++    Gi_data, Gj_data: (7,) datos lietorch SE3 world→cam de los dos keyframes.
++    vi, vj: (3,) velocidades body-en-mundo. g: (3,) gravedad mundo. pre: Preint.
++
++    Pose (`pose_jac="analytic"`, default): jacobiano ANALÍTICO (`pose_jacobians`)
++    en la MISMA base que la BA — la perturbación `Exp(d)·G` de `pose_retr`. Elimina
++    el forward-diff de 12 reevaluaciones del residual por arista (~4× fps, finding
++    2026-06-20-imu-tight-analytical-pose-jacobians). El modo `"numeric"` conserva
++    el forward-diff vía `SE3.retr` como referencia/fallback (lo usa el self-test).
++    Velocidad: jacobiano ANALÍTICO (`vel_jacobians`). Devuelve
++    (r (9,), Jpi (9,6), Jvi (9,3), Jpj (9,6), Jvj (9,3)).
++    """
++    from lietorch import SE3
++    dev = Gi_data.device
++    dt_type = vi.dtype
++    Ri, pi = pose_to_body(Gi_data.view(1, 7))
++    Rj, pj = pose_to_body(Gj_data.view(1, 7))
++    Ri = Ri[0].to(dt_type); pi = pi[0].to(dt_type)
++    Rj = Rj[0].to(dt_type); pj = pj[0].to(dt_type)
++    r0 = imu_residual(Ri, pi, vi, Rj, pj, vj, g, pre)
++    Jvi, Jvj = vel_jacobians(Ri, pre.DT)
++
++    if pose_jac == "analytic":
++        RiT_av = r0[3:6] + pre.dv.to(dt_type)                 # = Riᵀ·a_v
++        RiT_ap = r0[6:9] + pre.dp.to(dt_type)                 # = Riᵀ·a_p
++        Jpi, Jpj = pose_jacobians(Ri, Rj, RiT_av, RiT_ap, r0[0:3], pre.dR)
++        return r0, Jpi, Jvi, Jpj, Jvj
++
++    # ---- fallback NUMÉRICO (forward diff vía lietorch retr) ----
++    Gi = SE3(Gi_data.view(1, 7))
++    Gj = SE3(Gj_data.view(1, 7))
++    Jpi = torch.zeros(9, 6, device=dev, dtype=dt_type)
++    Jpj = torch.zeros(9, 6, device=dev, dtype=dt_type)
++    eye6 = torch.eye(6, device=dev, dtype=Gi_data.dtype) * eps
++    for k in range(6):
++        d = eye6[k].view(1, 6)
++        Rip, pip = pose_to_body(Gi.retr(d).data)
++        Jpi[:, k] = (imu_residual(Rip[0].to(dt_type), pip[0].to(dt_type),
++                                  vi, Rj, pj, vj, g, pre) - r0) / eps
++        Rjp, pjp = pose_to_body(Gj.retr(d).data)
++        Jpj[:, k] = (imu_residual(Ri, pi, vi, Rjp[0].to(dt_type),
++                                  pjp[0].to(dt_type), vj, g, pre) - r0) / eps
++    return r0, Jpi, Jvi, Jpj, Jvj
 diff --git a/dpvo/net.py b/dpvo/net.py
 index 2e74df7..126b77d 100644
 --- a/dpvo/net.py
