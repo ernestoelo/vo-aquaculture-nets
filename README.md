@@ -89,8 +89,8 @@ mkdir -p third_party/S_DPVO/weights   # descomprime dpvo.pth aquí
 
 # 5. Datos: coloca tus secuencias en data/recordings/ (los configs/runs/*.yaml
 #    apuntan ahí, relativos). Convierte un SVO a pares estéreo con:
-python scripts/svo_to_stereo_pngs.py --svo tu_video.svo \
-    --out data/recordings/mi_seq --scale 0.75
+python scripts/svo_to_stereo_pngs.py --input tu_video.svo \
+    --output data/recordings/mi_seq --scale 0.75
 ```
 
 > El repo **no incluye** el código upstream (DPVO/MAC-VO), los pesos ni los
@@ -116,6 +116,11 @@ python eval/eval_ate_tape_gt.py \
 ```
 
 ## 6. Resultados (resumen)
+
+> **Nombres de las secuencias**: aquí se usan los nombres internos de los
+> archivos; en el informe las mismas secuencias se llaman por su contenido:
+> `gym_v1/v2/v3` son **Aire-recto 1/2/3**, `video_4` es **Agua-loop** y las
+> secuencias del giro (sección 7) son **Aire-giros 1/2/3**.
 
 ### ATE: error de posición (alineamiento rígido, sin escala)
 
@@ -163,7 +168,7 @@ pierde por completo. Expresado como deriva honesta (cierre / recorrido de
 
 ### Recorrido (path length) por video: DPVO métrico crudo
 
-Cifras del Cuadro III del informe (corrida de ATE mediano de N=3). GT = camino
+Cifras del Cuadro IV del informe (corrida de ATE mediano de N=3). GT = camino
 de referencia (en `video_4` el loop recorre ~9 m de ida + ~9 m de vuelta = 18 m).
 
 | Secuencia | Path estimado | GT | Path / GT |
@@ -217,6 +222,10 @@ python scripts/run_sdpvo_metric.py --svo data/recordings/<video>.svo2 \
 # 3) métrica líder: rumbo de la cámara vs giroscopio (gyro = verdad física)
 python eval/eval_heading_vs_gyro_gt.py
 
+# 3b) benchmark consolidado del demo: cierre de lazo, camino integrado,
+#     escala por brazos y fps (reproduce los Cuadros VII/VIII/IX del informe)
+python eval/eval_giro_consolidated.py
+
 # 4) demo visual: .rrd interactivo (Rerun) y .mp4 offline
 python scripts/onoff_to_rerun.py       # requiere rerun-sdk
 python scripts/onoff_demo_video.py     # requiere ffmpeg
@@ -249,6 +258,28 @@ así que la planta ON reproduce la forma en V del recorrido real. El
 factor IMU cuesta ~31% de fps (22 a 15, unos 20 ms extra por frame en
 p50) gracias al jacobiano de pose analítico; con `--imu-v-reg 10`
 (default) los 9/9 runs corren sin divergencia.
+
+### Cierre de lazo del demo (mismo criterio que desnudó el colapso del loop)
+
+El recorrido real (~16 m) vuelve a la cinta 1, así que su cierre de lazo
+debe ser ≈ 0 (la misma métrica honesta de la sección 6). Calculado en la
+ventana útil del GT con `eval/eval_giro_consolidated.py`:
+
+| Secuencia | Cierre ON | Cierre OFF | Camino ON | Camino OFF | Camino GT |
+|---|---|---|---|---|---|
+| v1 | **0.84 m (5.3%)** | 6.01 m (37.6%) | 15.6 m | 36.3 m | ~16 m |
+| v2 | **0.52 m (3.3%)** | 4.93 m (30.8%) | 15.3 m | 38.2 m | ~16 m |
+| v3 | **0.73 m (4.5%)** | 2.58 m\* (16.2%) | 15.8 m | 41.6 m | ~16 m |
+
+**Con la fusión activa la trayectoria cierra el lazo (0.5 a 0.8 m, deriva
+3.3 a 5.3%) y su camino integrado coincide con el GT; sin IMU el cierre
+queda a metros y el camino se infla 2.3 a 2.6×.** El mismo criterio de
+cierre que desnudó el colapso del loop subacuático ahora califica la
+mejora.
+
+\* El cierre moderado de OFF en v3 es aparente: esa trayectoria sobre-rota
+251° y su escala por tramos está deformada (spread 1.21), el mismo patrón
+que el ZED PT en el loop subacuático (sección 6).
 
 ### Resultados negativos (documentados por honestidad)
 

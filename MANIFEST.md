@@ -45,6 +45,7 @@ abajo.
 | `eval_ate_tape_gt.py` | métricas along-track + cierre de lazo |
 | `eval_heading_vs_gyro_gt.py` | **Hito 3, métrica líder**: rumbo de la cámara vs giroscopio |
 | `eval_imu_siga_sweep.py` | **Hito 3**: escala por brazo + pico de rumbo del barrido `sig_a` |
+| `eval_giro_consolidated.py` | **Hito 3**: benchmark consolidado del demo on/off (cierre de lazo, camino integrado, escala, fps) |
 | `eval_scale_arms_gt.py` | **Hito 3**: escala por brazo del recorrido vs GT de cintas |
 | `build_gt_tum.py` | GT TUM desde los timecodes de cintas |
 | `make_slide_resultados_benchmark.py` | tabla maestra del benchmark |
